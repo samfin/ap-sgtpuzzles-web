@@ -20,4 +20,8 @@ cp -f ap-sgtpuzzles/build-emscripten/xsheep-puzzles/*.js dist/res
 cp -f ap-sgtpuzzles/build-emscripten/xsheep-puzzles/*.wasm dist/res
 
 mkdir -p dist/help
-cp -rf ap-sgtpuzzles/build-emscripten/help/. dist/help/
+if [ -d ap-sgtpuzzles/build-emscripten/help ]; then
+    cp -rf ap-sgtpuzzles/build-emscripten/help/. dist/help/
+else
+    echo "Warning: help/ was not built (halibut not found) -- skipping help file copy"
+fi
