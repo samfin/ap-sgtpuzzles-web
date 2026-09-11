@@ -697,23 +697,55 @@ function* combosOf(arr, k) {
 const MAX_CANDIDATES_PER_LEVEL = 100;
 
 /**
- * Finds a combination of not-yet-active cages that, when added, the real
- * solver forces at least one new cell from. Escalates combo size from 1 up
- * to maxComboSize; if nothing up to that size makes progress, falls back
- * to activating everything remaining at once (this always makes progress
- * against a puzzle that's fully solvable by the real solver with all
- * clues present).
+ * Queries the real solver for `activeSet` plus the given additional cage
+ * indices, and returns just the cells that are forced now but weren't
+ * already in `known`. Small helper shared by the combo search and the
+ * bisection fallback below.
+ */
+async function newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, extraIndices, known) {
+    const activeIndices = [...activeSet, ...extraIndices];
+    const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activeIndices);
+    const newlyForced = new Map();
+    for (const [cell, value] of forced) {
+        if (!known.has(cell)) newlyForced.set(cell, value);
+    }
+    return newlyForced;
+}
+
+/**
+ * Finds a set of not-yet-active cages that, when added, the real solver
+ * forces at least one new cell from. Two phases:
+ *
+ * 1. Escalates combo size from 1 up to maxComboSize, trying (a bounded
+ *    number of) combinations at each size, smallest-cage-first. This finds
+ *    genuinely small forcing sets cheaply when they exist -- a 2-cell
+ *    subtraction/division cage, for instance, is often independently
+ *    forced on its own.
+ * 2. Real Keen puzzles (especially at higher difficulty) routinely need
+ *    *most* of their cages visible before propagation forces anything at
+ *    all -- there is no small forcing combo to find. Falling straight back
+ *    to "activate literally everything remaining" in that case would
+ *    collapse the whole rest of the puzzle into one giant final stage
+ *    (which is exactly what was observed on a real generated 9x9: every
+ *    combo up to size 3 failed, so the very first stage swallowed every
+ *    cage). Instead, binary-search over how many of the remaining cages
+ *    (in the same smallest-first order) are needed as a PREFIX before
+ *    something becomes newly forced. This finds a much smaller "next
+ *    breakpoint" than "everything" whenever a smaller one exists, at a
+ *    cost of O(log n) solver queries instead of jumping straight to n.
+ *    It is not guaranteed to find the *globally* smallest forcing set (it
+ *    only searches prefixes of one fixed order, not arbitrary subsets),
+ *    but it is far finer-grained than the all-or-nothing fallback it
+ *    replaces, and combined with phase 1 running again on every
+ *    subsequent call (with a shrunken `remaining` and grown `activeSet`),
+ *    it lets a puzzle's natural decomposition keep subdividing instead of
+ *    bottoming out after one stage.
  *
  * Within a given combo size, this returns the FIRST combination found to
  * make progress rather than exhaustively searching for the one with the
  * fewest newly forced cells -- for a large cage count, finding the true
  * minimum would mean probing every combination even after already finding
- * a perfectly good one. To make that first hit come early (and keep
- * average-case cost low), candidates are tried smallest-cage-first: a
- * smaller cage (especially a 2-cell subtraction/division cage, which is
- * tightly constrained) is far more likely to be independently forced than
- * a large one, so trying those first tends to resolve at k=1 well before
- * the combo search would otherwise need to escalate.
+ * a perfectly good one.
  *
  * Calls are made one at a time (awaited in sequence, never in parallel) --
  * only one query may be in flight against the shared iframe's WASM module
@@ -726,31 +758,52 @@ async function findMinimalAddition(paramsStr, blockPart, clueTokens, activeSet, 
     const remainingArr = [...remaining].sort(
         (a, b) => cages[a].cells.length - cages[b].cells.length || a - b);
 
-    for (let k = 1; k <= Math.min(maxComboSize, remainingArr.length); k++) {
+    const comboLimit = Math.min(maxComboSize, remainingArr.length);
+    for (let k = 1; k <= comboLimit; k++) {
         let tried = 0;
         for (const combo of combosOf(remainingArr, k)) {
             if (tried++ >= MAX_CANDIDATES_PER_LEVEL) break;
 
-            const activeIndices = [...activeSet, ...combo];
-            const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activeIndices);
-            const newlyForced = new Map();
-            for (const [cell, value] of forced) {
-                if (!known.has(cell)) newlyForced.set(cell, value);
-            }
+            const newlyForced = await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, combo, known);
             if (newlyForced.size > 0) {
                 return { cageIndices: combo, newlyForced };
             }
         }
     }
 
-    // Fallback: activate everything remaining at once.
-    const activeIndices = [...activeSet, ...remainingArr];
-    const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activeIndices);
-    const newlyForced = new Map();
-    for (const [cell, value] of forced) {
-        if (!known.has(cell)) newlyForced.set(cell, value);
+    // Phase 1 already tried the full remaining set as a single "combo" of
+    // size remainingArr.length if that was <= maxComboSize -- in that case
+    // there is nothing smaller left to try, so just report whatever it
+    // found (possibly empty, meaning the real solver can't make any more
+    // progress at all -- handled defensively by the caller).
+    if (comboLimit === remainingArr.length) {
+        const newlyForced = await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, remainingArr, known);
+        return { cageIndices: remainingArr, newlyForced };
     }
-    return { cageIndices: remainingArr, newlyForced };
+
+    // Phase 2: binary-search the smallest prefix of remainingArr (beyond
+    // what phase 1 already ruled out) that forces something new. First
+    // confirm activating everything actually helps at all -- if it
+    // doesn't, no prefix will either, and this is the "genuinely stuck"
+    // case (shouldn't happen for a puzzle the real solver can fully solve
+    // with all clues present, but handled defensively).
+    const allNewlyForced = await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, remainingArr, known);
+    if (allNewlyForced.size === 0) {
+        return { cageIndices: remainingArr, newlyForced: allNewlyForced };
+    }
+
+    let lo = comboLimit + 1, hi = remainingArr.length;
+    while (lo < hi) {
+        const mid = lo + Math.floor((hi - lo) / 2);
+        const newlyForced = await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, remainingArr.slice(0, mid), known);
+        if (newlyForced.size > 0) hi = mid; else lo = mid + 1;
+    }
+
+    const prefix = remainingArr.slice(0, hi);
+    const newlyForced = hi === remainingArr.length
+        ? allNewlyForced
+        : await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, prefix, known);
+    return { cageIndices: prefix, newlyForced };
 }
 
 /**
