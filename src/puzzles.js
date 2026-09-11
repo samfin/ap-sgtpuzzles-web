@@ -936,9 +936,9 @@ function newlyCompletedStages(resolved, enteredGrid, clueSetCount, alreadyChecke
  * (capped at resolved.stages.length -- once every real stage is active,
  * their union already equals the whole solution, same convention as
  * newlyCompletedStages() above). This is exactly "every cell whose value
- * already follows logically from the clues currently visible" -- used for
- * the "highlight next solvable cells" UI option, not just for checking
- * stage completion.
+ * already follows logically from the clues currently visible" -- used by
+ * updateHintCells() below to find already-*solved* cells (see there for
+ * the separate, narrower "next clue set" cell set).
  *
  * @returns {Map<number,number>} cell -> forced digit
  */
@@ -951,6 +951,60 @@ function cumulativeForcedCells(resolved, clueSetCount) {
         }
     }
     return known;
+}
+
+/**
+ * Cells still needed to complete the *next* not-yet-checked reachable
+ * digit group -- the smallest stage index reachable at `clueSetCount`
+ * (i.e. < clueSetCount) that isn't already in `checkedStages` -- restricted
+ * to cells the player hasn't filled in yet (blank in `enteredGrid`).
+ *
+ * "Next" is found by scanning from the start, not just checking
+ * `checkedStages.size`: multiple Clue Set items can arrive before the
+ * player finishes solving earlier ones (e.g. several location checks
+ * releasing items in a batch), so more than one stage can be reachable
+ * without being checked yet, and the earliest of those is what the player
+ * should be working on next.
+ *
+ * When the configured digit_group_count exceeds the puzzle's natural
+ * stage count (see planClueGroups()'s clamp fallback in resolveKeenPuzzle),
+ * every stage index at or beyond resolved.stages.length has no cage-
+ * specific cells of its own -- it's satisfied only once the whole grid is
+ * filled, same convention as newlyCompletedStages() -- so once real
+ * stages are exhausted and one of those trailing indices is still
+ * unchecked, this returns every still-blank cell in the grid instead.
+ *
+ * @param {object} resolved - from resolveKeenPuzzle
+ * @param {number} clueSetCount
+ * @param {Set<number>} checkedStages
+ * @param {number[]} enteredGrid - row-major, length w*w, 0 = blank
+ * @returns {number[]} cell indices, or [] if every reachable group is
+ *   already checked (e.g. hintMode was just toggled on and this puzzle
+ *   happens to be fully caught up already)
+ */
+function nextRequiredCells(resolved, clueSetCount, checkedStages, enteredGrid) {
+    const totalStages = resolved.stages.length;
+    const n = Math.max(0, Math.min(clueSetCount, totalStages));
+
+    for (let k = 0; k < n; k++) {
+        if (checkedStages.has(k)) continue;
+        const cells = [];
+        for (const [cell, value] of resolved.stages[k].newlyForced) {
+            if (enteredGrid[cell] === 0) cells.push(cell);
+        }
+        return cells;
+    }
+
+    for (let k = totalStages; k < clueSetCount; k++) {
+        if (checkedStages.has(k)) continue;
+        const cells = [];
+        for (let cell = 0; cell < resolved.solution.length; cell++) {
+            if (enteredGrid[cell] === 0) cells.push(cell);
+        }
+        return cells;
+    }
+
+    return [];
 }
 
 /**
@@ -999,9 +1053,18 @@ class ArchipelagoPuzzle {
         this.clueSetCount = 0;
 
         // 0-indexed stage numbers (stage k == "Digit Group k+1") whose
-        // location has already been checked, per client.room.checkedLocations.
-        // Recomputed on every syncAPStatus().
+        // location has already been checked. Grown (never shrunk) by
+        // syncAPStatus() from client.room.checkedLocations, and added to
+        // directly by checkStageCompletion() the moment client.check() is
+        // called -- see syncAPStatus() for why it must never be rebuilt
+        // from scratch from server state.
         this.checkedStages = new Set();
+
+        // Chains reloadAtCurrentStage() calls so overlapping Clue Set
+        // reveals (several arriving close together) reload the shared
+        // puzzleframe one at a time instead of racing to reassign its
+        // `src` concurrently. See syncAPStatus().
+        this._reloadChain = Promise.resolve();
 
         // Resolved puzzle content (cages/solution/stages), computed once per
         // puzzle via a throwaway by-seed generation pass. See resolveContent().
@@ -1158,11 +1221,18 @@ class ArchipelagoPuzzle {
     }
 
     /**
-     * Recomputes and sends the "highlight next solvable cells" set to the
-     * puzzleframe: every currently-empty cell whose value already follows
-     * from the clues visible at this.clueSetCount. Sends an empty set
-     * (clearing any existing highlight) when the "hintMode" preference is
-     * off, or when this isn't the puzzle currently being displayed.
+     * Recomputes and sends the "highlight next solvable cells" sets to the
+     * puzzleframe -- two separate cell sets, highlighted differently:
+     *   - "next": still-blank cells required to complete the next
+     *     not-yet-checked reachable digit group (see nextRequiredCells()).
+     *     This is deliberately narrow -- just the one group the player
+     *     should be working on next, not everything currently deducible.
+     *   - "solved": cells that already follow from the clues visible at
+     *     this.clueSetCount (any reachable stage, not just the next one)
+     *     AND are already correctly filled in.
+     * Sends two empty sets (clearing any existing highlight) when the
+     * "hintMode" preference is off, or when this isn't the puzzle
+     * currently being displayed.
      *
      * @param {number[]} enteredGrid - row-major, length w*w, from
      *   reconstructKeenGrid() (0 = blank)
@@ -1172,16 +1242,20 @@ class ArchipelagoPuzzle {
         if (Alpine.store("puzzleList").current !== this) return;
 
         if (!Alpine.store("hintMode")) {
-            sendMessage("setHintCells", this.resolved.w, []);
+            sendMessage("setHintCells", this.resolved.w, [], []);
             return;
         }
 
         const known = cumulativeForcedCells(this.resolved, this.clueSetCount);
-        const hintCells = [];
+        const solvedCells = [];
         for (const [cell, value] of known) {
-            if (enteredGrid[cell] === 0) hintCells.push(cell);
+            if (enteredGrid[cell] === value) solvedCells.push(cell);
         }
-        sendMessage("setHintCells", this.resolved.w, hintCells);
+
+        const nextCells = nextRequiredCells(
+            this.resolved, this.clueSetCount, this.checkedStages, enteredGrid);
+
+        sendMessage("setHintCells", this.resolved.w, nextCells, solvedCells);
     }
 
     updateDescription() {
@@ -2051,24 +2125,47 @@ function syncAPStatus() {
 
                 // If this puzzle is currently open and already resolved,
                 // capture the player's moves and move it to the new stage.
+                // Chained through _reloadChain (rather than called
+                // directly) so that several Clue Set items arriving close
+                // together -- exactly the "multiple clue groups active at
+                // once" scenario -- queue their reloads instead of two
+                // overlapping reloadAtCurrentStage() calls racing to
+                // reassign the shared puzzleframe's src concurrently.
                 if (entry === puzzleList.current && entry.resolved) {
                     savePuzzleData();
-                    entry.reloadAtCurrentStage();
+                    entry._reloadChain = entry._reloadChain.then(
+                        () => entry.reloadAtCurrentStage());
                 }
             }
 
-            const newCheckedStages = new Set();
+            // Add any newly-server-confirmed stages, but NEVER remove one:
+            // client.check() (called by checkStageCompletion() the instant
+            // a stage's cells are filled in) marks a stage checked
+            // *locally* immediately, well before the server's own
+            // checkedLocations echoes back over the network -- and that
+            // echo can easily be reordered behind OTHER events this
+            // syncAPStatus() also reacts to (e.g. a "receivedItems" event
+            // for some unrelated item arriving before the "roomUpdate" for
+            // this check does). Rebuilding checkedStages from scratch here
+            // used to wipe out a stage the client already knows it checked
+            // whenever that race lost, and if no further move happened on
+            // this puzzle afterward (very plausible for an *intermediate*
+            // stage once the player's attention has moved on to finishing
+            // the last one), checkStageCompletion() never got another
+            // chance to re-detect and re-send it -- exactly the "multiple
+            // clue groups active at once, intermediate ones don't give
+            // items" symptom. A monotonic union can't lose a stage this
+            // way; it only ever confirms sooner what the client already
+            // believed.
             for (let k = 0; k < entry.digitGroupCount; k++) {
+                if (entry.checkedStages.has(k)) continue;
                 const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${k + 1}`);
                 if (locationId !== undefined && locationId !== null
                     && client.room.checkedLocations.includes(locationId)) {
-                    newCheckedStages.add(k);
+                    entry.checkedStages.add(k);
+                    dirty = true;
                 }
             }
-            if (newCheckedStages.size !== entry.checkedStages.size) {
-                dirty = true;
-            }
-            entry.checkedStages = newCheckedStages;
 
             const nowSolved = entry.checkedStages.size >= entry.digitGroupCount;
             if (nowSolved !== entry.solved) {

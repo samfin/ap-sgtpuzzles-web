@@ -129,9 +129,12 @@ function loadPuzzleData(data) {
 }
 
 // ---------------------------------------------------------------------
-// "Highlight next solvable cells" overlay -- a set of cell indices the
-// parent wants tinted (currently: cells whose value already follows
-// logically from the visible clues but the player hasn't filled in yet).
+// "Highlight next solvable cells" overlay -- two sets of cell indices the
+// parent wants tinted, in two different colors:
+//   - "next": cells required to complete the next not-yet-checked digit
+//     group (the one the player should be working on right now).
+//   - "solved": cells that are already deduced from the visible clues AND
+//     already correctly filled in, shown as positive feedback.
 // This is pure DOM/CSS on top of the puzzle canvas, not a native drawing
 // change: #hintoverlay is an absolutely-positioned, pointer-events:none
 // div sitting on top of #puzzlecanvas (see puzzleframe.html), and each
@@ -153,12 +156,14 @@ function loadPuzzleData(data) {
 // ---------------------------------------------------------------------
 
 let hintGridWidth = 0;
-let hintCellIndices = [];
+let hintNextCellIndices = [];
+let hintSolvedCellIndices = [];
 let hintResizeObserver = null;
 
-function setHintCells(gridWidth, cellIndices) {
+function setHintCells(gridWidth, nextCellIndices, solvedCellIndices) {
     hintGridWidth = gridWidth;
-    hintCellIndices = cellIndices || [];
+    hintNextCellIndices = nextCellIndices || [];
+    hintSolvedCellIndices = solvedCellIndices || [];
     ensureHintResizeObserver();
     renderHintOverlay();
 }
@@ -170,7 +175,8 @@ function renderHintOverlay() {
 
     overlay.innerHTML = "";
 
-    if (!hintGridWidth || hintCellIndices.length === 0 || !canvas.clientWidth) {
+    const totalCells = hintNextCellIndices.length + hintSolvedCellIndices.length;
+    if (!hintGridWidth || totalCells === 0 || !canvas.clientWidth) {
         overlay.style.width = "0px";
         overlay.style.height = "0px";
         return;
@@ -185,17 +191,24 @@ function renderHintOverlay() {
     const border = tileSize / 2;
 
     const fragment = document.createDocumentFragment();
-    for (const cell of hintCellIndices) {
-        const x = cell % w;
-        const y = Math.floor(cell / w);
-        const div = document.createElement("div");
-        div.className = "hint-cell";
-        div.style.left = (x * tileSize + border) + "px";
-        div.style.top = (y * tileSize + border) + "px";
-        div.style.width = tileSize + "px";
-        div.style.height = tileSize + "px";
-        fragment.appendChild(div);
-    }
+    const addCells = (cellIndices, className) => {
+        for (const cell of cellIndices) {
+            const x = cell % w;
+            const y = Math.floor(cell / w);
+            const div = document.createElement("div");
+            div.className = className;
+            div.style.left = (x * tileSize + border) + "px";
+            div.style.top = (y * tileSize + border) + "px";
+            div.style.width = tileSize + "px";
+            div.style.height = tileSize + "px";
+            fragment.appendChild(div);
+        }
+    };
+    // Solved cells first so, in the (normally impossible, since the two
+    // sets are disjoint by construction) case of any overlap, the "next
+    // required" tint wins visually.
+    addCells(hintSolvedCellIndices, "hint-cell-solved");
+    addCells(hintNextCellIndices, "hint-cell-next");
     overlay.appendChild(fragment);
 }
 
