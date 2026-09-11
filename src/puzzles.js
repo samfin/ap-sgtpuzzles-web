@@ -636,6 +636,69 @@ function rewriteSaveFileDesc(saveText, newDesc) {
     return out;
 }
 
+/**
+ * Rewrites a save file's entire move history to consist of exactly one
+ * 'R<x>,<y>,<n>' MOVE record per entry in `cells`, replacing whatever
+ * MOVE/SOLVE/RESTART records were there before, and recomputes NSTATES/
+ * STATEPOS so every one of those moves is applied (nothing left
+ * redoable). Used to rebuild a puzzle's save as "blank, except already-
+ * solved digit groups filled in" for the Restart button (see
+ * ArchipelagoPuzzle.restartToCheckedStages()) -- constructing a save with
+ * only the desired moves is simpler and safer than performing a native
+ * restart and then trying to replay moves into a live session.
+ *
+ * Every other record (DESC, GAME, PARAMS, CPARAMS, SEED, VERSION, ...) is
+ * carried over byte-for-byte, same convention -- including the same
+ * 8-char left-justified header requirement the real midend deserialiser
+ * needs -- as rewriteSaveFileDesc() above.
+ *
+ * @param {string} saveText - raw text from get_save_file()/a stored save
+ * @param {number} gridWidth
+ * @param {Map<number,number>} cells - cell index -> digit (row-major,
+ *   never 0 -- 0 would mean "clear", not needed here since these cells
+ *   simply aren't given a MOVE record at all)
+ * @returns {string} the rewritten save file text
+ */
+function rewriteSaveFileMoves(saveText, gridWidth, cells) {
+    const records = parseRecords(saveText);
+
+    const moveStrings = [];
+    for (const [cell, value] of cells) {
+        const x = cell % gridWidth;
+        const y = Math.floor(cell / gridWidth);
+        moveStrings.push(`R${x},${y},${value}`);
+    }
+    const nstates = String(moveStrings.length + 1);
+
+    let out = '';
+    let sawNstates = false;
+    let sawStatepos = false;
+    for (const { header, content } of records) {
+        if (header === 'MOVE' || header === 'SOLVE' || header === 'RESTART') continue;
+
+        const paddedHeader = header.padEnd(8, ' ');
+        if (header === 'NSTATES') {
+            sawNstates = true;
+            out += `${paddedHeader}:${nstates.length}:${nstates}\n`;
+        } else if (header === 'STATEPOS') {
+            sawStatepos = true;
+            out += `${paddedHeader}:${nstates.length}:${nstates}\n`;
+        } else {
+            out += `${paddedHeader}:${content.length}:${content}\n`;
+        }
+    }
+
+    if (!sawNstates || !sawStatepos) {
+        throw new Error('Save file missing NSTATES/STATEPOS');
+    }
+
+    for (const moveStr of moveStrings) {
+        out += `${'MOVE'.padEnd(8, ' ')}:${moveStr.length}:${moveStr}\n`;
+    }
+
+    return out;
+}
+
 // ---------------------------------------------------------------------
 // Progressive clue-group planning, built on the real Keen solver
 // (formerly keenSolver.js + keenProgression.js).
@@ -932,32 +995,14 @@ function newlyCompletedStages(resolved, enteredGrid, clueSetCount, alreadyChecke
 }
 
 /**
- * Union of every reachable stage's newlyForced map, up to `clueSetCount`
- * (capped at resolved.stages.length -- once every real stage is active,
- * their union already equals the whole solution, same convention as
- * newlyCompletedStages() above). This is exactly "every cell whose value
- * already follows logically from the clues currently visible" -- used by
- * updateHintCells() below to find already-*solved* cells (see there for
- * the separate, narrower "next clue set" cell set).
- *
- * @returns {Map<number,number>} cell -> forced digit
- */
-function cumulativeForcedCells(resolved, clueSetCount) {
-    const known = new Map();
-    const n = Math.max(0, Math.min(clueSetCount, resolved.stages.length));
-    for (let k = 0; k < n; k++) {
-        for (const [cell, value] of resolved.stages[k].newlyForced) {
-            known.set(cell, value);
-        }
-    }
-    return known;
-}
-
-/**
- * Cells still needed to complete the *next* not-yet-checked reachable
- * digit group -- the smallest stage index reachable at `clueSetCount`
- * (i.e. < clueSetCount) that isn't already in `checkedStages` -- restricted
- * to cells the player hasn't filled in yet (blank in `enteredGrid`).
+ * Cells belonging to the *next* not-yet-checked reachable digit group --
+ * the smallest stage index reachable at `clueSetCount` (i.e. < clueSetCount)
+ * that isn't already in `checkedStages`. Returns every cell in that stage's
+ * newlyForced map, regardless of whether the player has already filled it
+ * in (correctly or not) -- this is deliberately indifferent to fill state:
+ * the highlight only ever indicates *which cells are needed for the next
+ * unlock*, never whether an entered digit is right or wrong, since that
+ * would tip the player off and encourage guess-and-check.
  *
  * "Next" is found by scanning from the start, not just checking
  * `checkedStages.size`: multiple Clue Set items can arrive before the
@@ -972,39 +1017,77 @@ function cumulativeForcedCells(resolved, clueSetCount) {
  * specific cells of its own -- it's satisfied only once the whole grid is
  * filled, same convention as newlyCompletedStages() -- so once real
  * stages are exhausted and one of those trailing indices is still
- * unchecked, this returns every still-blank cell in the grid instead.
+ * unchecked, this returns every cell in the grid instead.
  *
  * @param {object} resolved - from resolveKeenPuzzle
  * @param {number} clueSetCount
  * @param {Set<number>} checkedStages
- * @param {number[]} enteredGrid - row-major, length w*w, 0 = blank
  * @returns {number[]} cell indices, or [] if every reachable group is
  *   already checked (e.g. hintMode was just toggled on and this puzzle
  *   happens to be fully caught up already)
  */
-function nextRequiredCells(resolved, clueSetCount, checkedStages, enteredGrid) {
+function nextRequiredCells(resolved, clueSetCount, checkedStages) {
     const totalStages = resolved.stages.length;
     const n = Math.max(0, Math.min(clueSetCount, totalStages));
 
     for (let k = 0; k < n; k++) {
         if (checkedStages.has(k)) continue;
-        const cells = [];
-        for (const [cell, value] of resolved.stages[k].newlyForced) {
-            if (enteredGrid[cell] === 0) cells.push(cell);
-        }
-        return cells;
+        return [...resolved.stages[k].newlyForced.keys()];
     }
 
     for (let k = totalStages; k < clueSetCount; k++) {
         if (checkedStages.has(k)) continue;
         const cells = [];
         for (let cell = 0; cell < resolved.solution.length; cell++) {
-            if (enteredGrid[cell] === 0) cells.push(cell);
+            cells.push(cell);
         }
         return cells;
     }
 
     return [];
+}
+
+/**
+ * Union of every already-*checked* (fully solved and awarded) stage's
+ * newlyForced cell->digit map -- used to refill known-solved digits after
+ * a restart (see ArchipelagoPuzzle.restartToCheckedStages() below), since
+ * the player has already logically earned those digits and re-entering
+ * them by hand on every restart would serve no purpose.
+ *
+ * Each real stage's newlyForced cells are disjoint by construction (every
+ * forced cell belongs to exactly one stage -- see resolveKeenPuzzle's
+ * coverage invariant), so a plain union across checked stages is safe and
+ * needs no ordering. If a trailing "virtual" stage (index >=
+ * resolved.stages.length, only reachable when the configured
+ * digit_group_count exceeds the puzzle's natural stage count -- see
+ * newlyCompletedStages()) has been checked, the whole grid must already
+ * match the solution for that to have happened, so every remaining cell
+ * is filled in from resolved.solution too.
+ *
+ * @param {object} resolved - from resolveKeenPuzzle
+ * @param {Set<number>} checkedStages
+ * @returns {Map<number,number>} cell -> digit
+ */
+function checkedStageCells(resolved, checkedStages) {
+    const totalStages = resolved.stages.length;
+    const cells = new Map();
+
+    for (const k of checkedStages) {
+        if (k >= totalStages) continue;
+        for (const [cell, value] of resolved.stages[k].newlyForced) {
+            cells.set(cell, value);
+        }
+    }
+
+    for (const k of checkedStages) {
+        if (k < totalStages) continue;
+        for (let cell = 0; cell < resolved.solution.length; cell++) {
+            if (!cells.has(cell)) cells.set(cell, resolved.solution[cell]);
+        }
+        break; // one checked virtual stage already covers the whole grid
+    }
+
+    return cells;
 }
 
 /**
@@ -1172,6 +1255,53 @@ class ArchipelagoPuzzle {
     }
 
     /**
+     * Restarts this puzzle back to a blank grid, except that any digit
+     * group already checked (fully solved and awarded) is immediately
+     * refilled with its known-correct digits -- the player has already
+     * logically earned those, so restart shouldn't force re-entering them.
+     * No-op fallback to a plain native restart if there's no save (or no
+     * puzzle content resolved yet) to build the replacement from -- in
+     * that case there's nothing solved to preserve anyway.
+     *
+     * Implemented by constructing a fresh save file with exactly one MOVE
+     * record per already-checked cell (see rewriteSaveFileMoves()) and
+     * reloading from it, rather than issuing the native restart command
+     * and then trying to replay moves into the live session -- the native
+     * restart command only knows how to reset to a literally blank grid,
+     * with no way to inject moves afterwards other than a fresh save load
+     * (the same mechanism reloadAtCurrentStage() above already relies on).
+     */
+    async restartToCheckedStages() {
+        if (!this.resolved) {
+            sendMessage("restartPuzzle");
+            return;
+        }
+
+        const gamesaves = Alpine.store("gamesaves");
+        const existingSave = gamesaves.current
+            ? await gamesaves.current.getPuzzleSave(this.index)
+            : null;
+        if (!existingSave) {
+            sendMessage("restartPuzzle");
+            return;
+        }
+
+        const solvedCells = checkedStageCells(this.resolved, this.checkedStages);
+
+        let rewritten;
+        try {
+            rewritten = rewriteSaveFileMoves(existingSave, this.resolved.w, solvedCells);
+        } catch (e) {
+            console.warn(`Couldn't rebuild save for puzzle ${this.index}, falling back to a plain restart:`, e);
+            sendMessage("restartPuzzle");
+            return;
+        }
+
+        await gamesaves.current.setPuzzleSave(this.index, rewritten);
+        await loadPuzzle(this.genre, this.puzzleId, true, this.index);
+    }
+
+    /**
      * Checks the player's currently-entered digits (reconstructed from a
      * `get_save_file()` round trip) against each
      * not-yet-checked, currently-reachable digit group's target cells, and
@@ -1195,7 +1325,7 @@ class ArchipelagoPuzzle {
         // Independent of Archipelago connectivity -- this is a solving
         // aid, not a location check -- so update it even if isApReady()
         // is false below (e.g. single/freeplay mode).
-        this.updateHintCells(grid);
+        this.updateHintCells();
 
         if (!isApReady()) return;
 
@@ -1221,41 +1351,30 @@ class ArchipelagoPuzzle {
     }
 
     /**
-     * Recomputes and sends the "highlight next solvable cells" sets to the
-     * puzzleframe -- two separate cell sets, highlighted differently:
-     *   - "next": still-blank cells required to complete the next
-     *     not-yet-checked reachable digit group (see nextRequiredCells()).
-     *     This is deliberately narrow -- just the one group the player
-     *     should be working on next, not everything currently deducible.
-     *   - "solved": cells that already follow from the clues visible at
-     *     this.clueSetCount (any reachable stage, not just the next one)
-     *     AND are already correctly filled in.
-     * Sends two empty sets (clearing any existing highlight) when the
+     * Recomputes and sends the "highlight next solvable cells" set to the
+     * puzzleframe: every cell belonging to the next not-yet-checked
+     * reachable digit group (see nextRequiredCells()), all in one highlight
+     * color regardless of whether the player has already filled any of
+     * them in. This is deliberate: the highlight only ever indicates which
+     * cells are needed for the next unlock, never whether an entered digit
+     * is correct, so it can't be used to guess-and-check.
+     * Sends an empty set (clearing any existing highlight) when the
      * "hintMode" preference is off, or when this isn't the puzzle
      * currently being displayed.
-     *
-     * @param {number[]} enteredGrid - row-major, length w*w, from
-     *   reconstructKeenGrid() (0 = blank)
      */
-    updateHintCells(enteredGrid) {
+    updateHintCells() {
         if (!this.resolved) return;
         if (Alpine.store("puzzleList").current !== this) return;
 
         if (!Alpine.store("hintMode")) {
-            sendMessage("setHintCells", this.resolved.w, [], []);
+            sendMessage("setHintCells", this.resolved.w, []);
             return;
         }
 
-        const known = cumulativeForcedCells(this.resolved, this.clueSetCount);
-        const solvedCells = [];
-        for (const [cell, value] of known) {
-            if (enteredGrid[cell] === value) solvedCells.push(cell);
-        }
-
         const nextCells = nextRequiredCells(
-            this.resolved, this.clueSetCount, this.checkedStages, enteredGrid);
+            this.resolved, this.clueSetCount, this.checkedStages);
 
-        sendMessage("setHintCells", this.resolved.w, nextCells, solvedCells);
+        sendMessage("setHintCells", this.resolved.w, nextCells);
     }
 
     updateDescription() {
@@ -1976,6 +2095,13 @@ function puzzleFromSeed() {
 }
 
 function restartPuzzle() {
+    const entry = Alpine.store("puzzleList").current;
+
+    if (entry instanceof ArchipelagoPuzzle && entry.genre === "keen" && entry.resolved) {
+        entry.restartToCheckedStages();
+        return;
+    }
+
     sendMessage("restartPuzzle");
 }
 
