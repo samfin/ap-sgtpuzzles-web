@@ -99,6 +99,16 @@ function savePuzzleData() {
     sendMessage("savePuzzleDataCallback", savefile_text);
 }
 
+function getForcedCells(paramsStr, descStr) {
+    // defined in {genre}.js via cwrap (see emccpre-ap.js); only
+    // callable once a genre has actually been loaded via loadPuzzle().
+    var ptr = get_forced_cells_for_desc(paramsStr, descStr);
+    var result = UTF8ToString(ptr);
+    free_forced_cells(ptr);
+
+    sendMessage("getForcedCellsCallback", result);
+}
+
 function loadPuzzleData(data) {
     // Encode data as UTF-8 Uint8Array
     let encoder = new TextEncoder();
@@ -124,7 +134,7 @@ const messageHandlers = {
     newPuzzle, restartPuzzle, undoPuzzle, redoPuzzle, solvePuzzle,
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
-    savePuzzleData, loadPuzzleData
+    savePuzzleData, loadPuzzleData, getForcedCells
 }
 
 function processMessage(message) {

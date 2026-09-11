@@ -81,7 +81,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
-// include: C:/Users/Admin/Desktop/apworld/ap-sgtpuzzles-web/ap-sgtpuzzles/emccpre.js
+// include: C:/Users/Admin/Desktop/apworld/ap-sgtpuzzles-web/ap-sgtpuzzles/emccpre-ap.js
 /*
  * emccpre.js: one of the Javascript components of an Emscripten-based
  * web/Javascript front end for Puzzles.
@@ -183,7 +183,7 @@ var Module = {
     },
     // Pass argv[1] as the fragment identifier (so that permalinks of
     // the form puzzle.html#game-id can launch the specified id).
-    'arguments': [decodeURIComponent(location.hash)],
+    'arguments': ["#"+puzzleId],
     'noExitRuntime': true
 };
 
@@ -234,6 +234,11 @@ var savefile_read_callback;
 // Callback for passing in preferences data retrieved from localStorage.
 var prefs_load_callback;
 
+// void set_allowed_shortcuts(bool new_game_allowed, bool solve_game_allowed, bool undo_allowed);
+//
+// Callback for disabling keyboard shortcuts.
+var set_allowed_shortcuts;
+
 // The <ul> object implementing the game-type drop-down, and a list of
 // the sub-lists inside it. Used by js_add_preset().
 var gametypelist = document.getElementById("gametype");
@@ -241,6 +246,10 @@ var gametypesubmenus = [gametypelist];
 
 // C entry point for miscellaneous events.
 var command;
+
+var get_save_file, free_save_file
+var load_game
+var get_forced_cells_for_desc, free_forced_cells
 
 // The <form> encapsulating the menus.  Used by
 // js_get_selected_preset() and js_select_preset().
@@ -385,14 +394,14 @@ function dialog_launch(ok_function, cancel_function) {
 
     document.body.appendChild(dlg_dimmer);
     document.body.appendChild(dlg_form);
-    dlg_form.querySelector("input,select,a").focus();
+    //dlg_form.querySelector("input,select,a").focus();
 }
 
 function dialog_cleanup() {
     document.body.removeChild(dlg_dimmer);
     document.body.removeChild(dlg_form);
     dlg_dimmer = dlg_form = null;
-    onscreen_canvas.focus();
+    //onscreen_canvas.focus();
 }
 
 function set_capture(element, event) {
@@ -413,13 +422,32 @@ function initPuzzle() {
 
     // Stop right-clicks on the puzzle from popping up a context menu.
     // We need those right-clicks!
-    onscreen_canvas.oncontextmenu = function(event) { return false; }
+    onscreen_canvas.oncontextmenu = function(event) {
+        if (touchEmulationActive && !touchEmulationDown) {
+            touchEmulationButton = 2;
+            touchEmulationDown = true;
+            var xy = canvas_mouse_coords(event, onscreen_canvas);
+            mousedown(xy.x, xy.y, touchEmulationButton)
+        }
+        return false;
+    }
 
     // Set up mouse handlers. We do a bit of tracking of the currently
     // pressed mouse buttons, to avoid sending mousemoves with no
     // button down (our puzzles don't want those events).
     var mousedown = Module.cwrap('mousedown', 'boolean',
                                  ['number', 'number', 'number']);
+    var mousemove = Module.cwrap('mousemove', 'boolean',
+                                 ['number', 'number', 'number']);
+    var mouseup = Module.cwrap('mouseup', 'boolean',
+                               ['number', 'number', 'number']);
+    
+    var touchEmulationDown = false;
+    var touchEmulationActive = false;
+    var touchEmulationButton = 0;
+    var touchEmulationStartPos = {x: 0, y: 0};
+    var touchEmulationStartScreenPos = {x: 0, y: 0};
+    const touchEmulationDragThreshold = 10;
 
     var button_phys2log = [null, null, null];
     var buttons_down = function() {
@@ -430,53 +458,108 @@ function initPuzzle() {
         return toret;
     };
 
-    onscreen_canvas.onpointerdown = function(event) {
-        // Arrange that all mouse (and pointer) events are sent to
-        // this element until all buttons are released.  We can assume
-        // that if we managed to receive a pointerdown event,
-        // Element.setPointerCapture() is available.
-        onscreen_canvas.setPointerCapture(event.pointerId);
-    }
-    onscreen_canvas.onmousedown = function(event) {
+    // Capture everything except pinch zoom events
+    onscreen_canvas.style.touchAction = "pinch-zoom"
+
+    onscreen_canvas.onpointerdown = function (event) {
+        if (!event.isPrimary) {
+            return;
+        }
+
         if (event.button >= 3)
             return;
+
+        onscreen_canvas.setPointerCapture(event.pointerId)
+        onscreen_canvas.focus()
 
         var xy = canvas_mouse_coords(event, onscreen_canvas);
-        var logbutton = event.button;
-        if (event.shiftKey)
-            logbutton = 1;   // Shift-click overrides to middle button
-        else if (event.ctrlKey)
-            logbutton = 2;   // Ctrl-click overrides to right button
 
-        if (mousedown(xy.x, xy.y, logbutton))
-            event.preventDefault();
-        button_phys2log[event.button] = logbutton;
+        touchEmulationActive = event.button == 0 && event.pointerType.includes("touch");
+        if (touchEmulationActive) {
+            // Wait for possible long press (via oncontextmenu)
+            touchEmulationButton = 0;
+            touchEmulationDown = false;
+            touchEmulationStartPos = xy;
+            touchEmulationStartScreenPos = {x: event.screenX, y: event.screenY}
+        } else {
+            var logbutton = event.button;
+            if (event.shiftKey)
+                logbutton = 1;   // Shift-click overrides to middle button
+            else if (event.ctrlKey)
+                logbutton = 2;   // Ctrl-click overrides to right button
 
-        set_capture(onscreen_canvas, event);
-    };
-    var mousemove = Module.cwrap('mousemove', 'boolean',
-                                 ['number', 'number', 'number']);
-    onscreen_canvas.onmousemove = function(event) {
-        var down = buttons_down();
-        if (down) {
-            var xy = canvas_mouse_coords(event, onscreen_canvas);
-            if (mousemove(xy.x, xy.y, down))
+            if (mousedown(xy.x, xy.y, logbutton))
                 event.preventDefault();
+            button_phys2log[event.button] = logbutton;
         }
     };
-    var mouseup = Module.cwrap('mouseup', 'boolean',
-                               ['number', 'number', 'number']);
-    onscreen_canvas.onmouseup = function(event) {
+    onscreen_canvas.onpointermove = function (event) {
+        if (!event.isPrimary) {
+            return false;
+        }
+
+        if (touchEmulationActive) {
+            event.preventDefault();
+
+            if (!touchEmulationDown) {
+                // Check if movement exceeds threshold
+                var dx = event.screenX - touchEmulationStartScreenPos.x
+                var dy = event.screenY - touchEmulationStartScreenPos.y
+                const thresholdSquared = touchEmulationDragThreshold*touchEmulationDragThreshold;
+                if (dx*dx + dy*dy >= thresholdSquared) {
+                    touchEmulationDown = true;
+                    // Send a mousedown if we haven't yet
+                    mousedown(touchEmulationStartPos.x, touchEmulationStartPos.y, touchEmulationButton)
+                }
+            }
+            if (touchEmulationDown) {
+                var xy = canvas_mouse_coords(event, onscreen_canvas);
+                mousemove(xy.x, xy.y, 1 << touchEmulationButton)
+            }
+        } else {
+            var down = buttons_down();
+            if (down) {
+                var xy = canvas_mouse_coords(event, onscreen_canvas);
+                if (mousemove(xy.x, xy.y, down))
+                    event.preventDefault();
+            }
+        }
+    };
+    onscreen_canvas.onpointerup = function (event) {
+        if (!event.isPrimary) {
+            return;
+        }
+
         if (event.button >= 3)
             return;
 
-        if (button_phys2log[event.button] !== null) {
+        if (touchEmulationActive) {
             var xy = canvas_mouse_coords(event, onscreen_canvas);
-            if (mouseup(xy.x, xy.y, button_phys2log[event.button]))
+            if (!touchEmulationDown) {
+                // Send a mousedown if we haven't yet
+                mousedown(xy.x, xy.y, touchEmulationButton)
+            }
+            if (mouseup(xy.x, xy.y, touchEmulationButton))
                 event.preventDefault();
-            button_phys2log[event.button] = null;
+            touchEmulationDown = false;
+            touchEmulationActive = false;
+        } else {
+            if (button_phys2log[event.button] !== null) {
+                var xy = canvas_mouse_coords(event, onscreen_canvas);
+                if (mouseup(xy.x, xy.y, button_phys2log[event.button]))
+                    event.preventDefault();
+                button_phys2log[event.button] = null;
+            }
         }
     };
+    onscreen_canvas.onpointercancel = function (event) {
+        if (!touchEmulationDown) {
+            // Send a mouseup if we have to
+            mouseup(touchEmulationStartPos.x, touchEmulationStartPos.y, touchEmulationButton)
+        }
+        touchEmulationDown = false;
+        touchEmulationActive = false;
+    }
 
     // Set up keyboard handlers. We call event.preventDefault()
     // in the keydown handler if it looks like we might have
@@ -536,9 +619,12 @@ function initPuzzle() {
     };
 
     // 'number' is used for C pointers
-    var get_save_file = Module.cwrap('get_save_file', 'number', []);
-    var free_save_file = Module.cwrap('free_save_file', 'void', ['number']);
-    var load_game = Module.cwrap('load_game', 'void', []);
+    get_save_file = Module.cwrap('get_save_file', 'number', []);
+    free_save_file = Module.cwrap('free_save_file', 'void', ['number']);
+    load_game = Module.cwrap('load_game', 'void', []);
+    get_forced_cells_for_desc = Module.cwrap('get_forced_cells_for_desc', 'number',
+                                              ['string', 'string']);
+    free_forced_cells = Module.cwrap('free_forced_cells', 'void', ['number']);
 
     if (save_button) save_button.onclick = function(event) {
         if (dlg_dimmer === null) {
@@ -591,7 +677,7 @@ function initPuzzle() {
                 }
             });
             input.click();
-            onscreen_canvas.focus();
+            //onscreen_canvas.focus();
         }
     };
 
@@ -813,6 +899,8 @@ function initPuzzle() {
     timer_callback = Module.cwrap('timer_callback', 'void', ['number']);
     prefs_load_callback = Module.cwrap('prefs_load_callback', 'void',
                                        ['number','number']);
+    set_allowed_shortcuts = Module.cwrap('set_allowed_shortcuts', 'void',
+                                         ['boolean', 'boolean', 'boolean'])
 
     if (resizable_div !== null) {
         var resize_handle = document.getElementById("resizehandle");
@@ -925,9 +1013,9 @@ function post_init() {
     document.getElementById("puzzle").style.display = "";
 
     // Default to giving keyboard focus to the puzzle.
-    onscreen_canvas.focus();
+    //onscreen_canvas.focus();
 }
-// end include: C:/Users/Admin/Desktop/apworld/ap-sgtpuzzles-web/ap-sgtpuzzles/emccpre.js
+// end include: C:/Users/Admin/Desktop/apworld/ap-sgtpuzzles-web/ap-sgtpuzzles/emccpre-ap.js
 
 
 var programArgs = [];
@@ -1959,6 +2047,7 @@ async function createWasm() {
       }
 
   function _js_add_preset(menuid, ptr, value) {
+          sendMessage("js_add_preset", menuid, UTF8ToString(ptr), value);
           var name = UTF8ToString(ptr);
           var item = document.createElement("li");
           var label = document.createElement("label");
@@ -1997,6 +2086,7 @@ async function createWasm() {
           gametypesubmenus[menuid].appendChild(item);
           var toret = gametypesubmenus.length;
           gametypesubmenus.push(submenu);
+          sendMessage("js_add_preset_submenu", menuid, UTF8ToString(ptr), toret);
           return toret;
       }
 
@@ -2250,12 +2340,14 @@ async function createWasm() {
       }
 
   function _js_canvas_remove_statusbar() {
+          sendMessage("js_canvas_remove_statusbar");
           if (statusbar !== null)
               statusbar.parentNode.removeChild(statusbar);
           statusbar = null;
       }
 
   function _js_canvas_set_size(w, h, new_fe_scale) {
+          sendMessage("js_canvas_set_size", w, h);
           onscreen_canvas.width = w;
           offscreen_canvas.width = w;
           if (resizable_div !== null)
@@ -2280,6 +2372,7 @@ async function createWasm() {
       }
 
   function _js_canvas_status_bar(dr, ptr) {
+          sendMessage("js_canvas_set_statusbar", UTF8ToString(ptr));
           statusbar.textContent = UTF8ToString(ptr);
       }
 
@@ -2304,6 +2397,7 @@ async function createWasm() {
       }
 
   function _js_dialog_boolean(index, title, initvalue) {
+          sendMessage("js_dialog_boolean", index, UTF8ToString(title), initvalue);
           var checkbox = document.createElement("input");
           checkbox.type = "checkbox";
           checkbox.checked = (initvalue != 0);
@@ -2319,6 +2413,7 @@ async function createWasm() {
       }
 
   function _js_dialog_choices(index, title, choicelist, initvalue) {
+          sendMessage("js_dialog_choices", index, UTF8ToString(title), UTF8ToString(choicelist), initvalue);
           var label = document.createElement("label");
           label.textContent = UTF8ToString(title);
           dlg_form.appendChild(label);
@@ -2350,14 +2445,17 @@ async function createWasm() {
       }
 
   function _js_dialog_cleanup() {
+          sendMessage("js_dialog_cleanup");
           dialog_cleanup();
       }
 
   function _js_dialog_init(titletext) {
+          sendMessage("js_dialog_init", UTF8ToString(titletext));
           dialog_init(UTF8ToString(titletext));
       }
 
   function _js_dialog_launch() {
+          sendMessage("js_dialog_launch");
           dialog_launch(function(event) {
               for (var i in dlg_return_funcs)
                   dlg_return_funcs[i]();
@@ -2368,6 +2466,7 @@ async function createWasm() {
       }
 
   function _js_dialog_string(index, title, initialtext) {
+          sendMessage("js_dialog_string", index, UTF8ToString(title), UTF8ToString(initialtext));
           var label = document.createElement("label");
           label.textContent = UTF8ToString(title);
           dlg_form.appendChild(label);
@@ -2383,16 +2482,18 @@ async function createWasm() {
       }
 
   function _js_enable_undo_redo(undo, redo) {
+          sendMessage("js_enable_undo_redo", undo, redo);
           disable_menu_item(undo_button, (undo == 0));
           disable_menu_item(redo_button, (redo == 0));
       }
 
   function _js_error_box(ptr) {
-          alert(UTF8ToString(ptr));
+          sendMessage("js_error_box", UTF8ToString(ptr));
+          //alert(UTF8ToString(ptr));
       }
 
   function _js_focus_canvas() {
-          onscreen_canvas.focus();
+          sendMessage("js_focus_canvas");
       }
 
   function _js_get_date_64(ptr) {
@@ -2409,10 +2510,12 @@ async function createWasm() {
       }
 
   function _js_init_puzzle() {
+          sendMessage("js_init_puzzle");
           initPuzzle();
       }
 
   function _js_load_prefs(me) {
+          // TODO figure this out
           function load_prefs_from_string(prefsdata) {
               if (prefsdata !== undefined && prefsdata !== null) {
                   var lenbytes = lengthBytesUTF8(prefsdata) + 1;
@@ -2431,7 +2534,7 @@ async function createWasm() {
           // Load saved preferences if they exist.
           try {
               load_prefs_from_string(
-                  localStorage.getItem(location.pathname + " preferences"));
+                  localStorage.getItem(genre + " preferences"));
           } catch (error) {
               // Log the error but otherwise pretend the settings were
               // absent.
@@ -2440,10 +2543,12 @@ async function createWasm() {
       }
 
   function _js_post_init() {
+          sendMessage("js_post_init");
           post_init();
       }
 
   function _js_remove_solve_button() {
+          sendMessage("js_remove_solve_button");
           if (solve_button === null) return;
           var solve_item = solve_button.closest("li");
           if (solve_item === null) return;
@@ -2452,6 +2557,7 @@ async function createWasm() {
       }
 
   function _js_remove_type_dropdown() {
+          sendMessage("js_remove_type_dropdown");
           if (gametypelist === null) return;
           var gametypeitem = gametypelist.closest("li");
           if (gametypeitem === null) return;
@@ -2462,7 +2568,7 @@ async function createWasm() {
   function _js_save_prefs(buf) {
           var prefsdata = UTF8ToString(buf);
           try {
-              localStorage.setItem(location.pathname + " preferences", prefsdata);
+              localStorage.setItem(genre + " preferences", prefsdata);
           } catch (error) {
               // Tell the user their preferences have not been saved.
               console.error(error);
@@ -2475,17 +2581,21 @@ async function createWasm() {
       }
 
   function _js_select_preset(n) {
+          sendMessage("js_select_preset", n);
           menuform.elements["preset"].value = n;
       }
 
   function _js_set_colour(colour_number, colour_string) {
           colours[colour_number] = UTF8ToString(colour_string);
-          if (colour_number == 0)
+          if (colour_number == 0) {
+              setBackgroundColor(colours[colour_number]);
               document.documentElement.style.setProperty("--puzzle-background",
                                                          colours[colour_number]);
+          }
       }
 
   function _js_update_key_labels(lsk_ptr, csk_ptr) {
+          sendMessage("js_update_key_labels", UTF8ToString(lsk_ptr), UTF8ToString(csk_ptr));
           var elem;
           var lsk_text = UTF8ToString(lsk_ptr);
           var csk_text = UTF8ToString(csk_ptr);
@@ -2496,6 +2606,7 @@ async function createWasm() {
       }
 
   function _js_update_permalinks(desc, seed) {
+          sendMessage("js_update_permalinks", UTF8ToString(desc), UTF8ToString(seed));
           desc = encodeURI(UTF8ToString(desc)).replace(/#/g, "%23");
           if (permalink_desc !== null)
               permalink_desc.href = "#" + desc;
@@ -2509,6 +2620,10 @@ async function createWasm() {
                   permalink_seed.style.display = "";
               }
           }
+      }
+
+  function _js_update_status(status) {
+          sendMessage("js_update_status", status)
       }
 
   
@@ -3148,8 +3263,11 @@ var _get_text_format = Module['_get_text_format'] = makeInvalidEarlyAccess('_get
 var _free_text_format = Module['_free_text_format'] = makeInvalidEarlyAccess('_free_text_format');
 var _get_save_file = Module['_get_save_file'] = makeInvalidEarlyAccess('_get_save_file');
 var _free_save_file = Module['_free_save_file'] = makeInvalidEarlyAccess('_free_save_file');
+var _get_forced_cells_for_desc = Module['_get_forced_cells_for_desc'] = makeInvalidEarlyAccess('_get_forced_cells_for_desc');
+var _free_forced_cells = Module['_free_forced_cells'] = makeInvalidEarlyAccess('_free_forced_cells');
 var _load_game = Module['_load_game'] = makeInvalidEarlyAccess('_load_game');
 var _prefs_load_callback = Module['_prefs_load_callback'] = makeInvalidEarlyAccess('_prefs_load_callback');
+var _set_allowed_shortcuts = Module['_set_allowed_shortcuts'] = makeInvalidEarlyAccess('_set_allowed_shortcuts');
 var _main = Module['_main'] = makeInvalidEarlyAccess('_main');
 var _fflush = makeInvalidEarlyAccess('_fflush');
 var _emscripten_stack_get_end = makeInvalidEarlyAccess('_emscripten_stack_get_end');
@@ -3182,8 +3300,11 @@ function assignWasmExports(wasmExports) {
   assert(typeof wasmExports['free_text_format'] != 'undefined', 'missing Wasm export: free_text_format');
   assert(typeof wasmExports['get_save_file'] != 'undefined', 'missing Wasm export: get_save_file');
   assert(typeof wasmExports['free_save_file'] != 'undefined', 'missing Wasm export: free_save_file');
+  assert(typeof wasmExports['get_forced_cells_for_desc'] != 'undefined', 'missing Wasm export: get_forced_cells_for_desc');
+  assert(typeof wasmExports['free_forced_cells'] != 'undefined', 'missing Wasm export: free_forced_cells');
   assert(typeof wasmExports['load_game'] != 'undefined', 'missing Wasm export: load_game');
   assert(typeof wasmExports['prefs_load_callback'] != 'undefined', 'missing Wasm export: prefs_load_callback');
+  assert(typeof wasmExports['set_allowed_shortcuts'] != 'undefined', 'missing Wasm export: set_allowed_shortcuts');
   assert(typeof wasmExports['__main_argc_argv'] != 'undefined', 'missing Wasm export: __main_argc_argv');
   assert(typeof wasmExports['fflush'] != 'undefined', 'missing Wasm export: fflush');
   assert(typeof wasmExports['emscripten_stack_get_end'] != 'undefined', 'missing Wasm export: emscripten_stack_get_end');
@@ -3213,8 +3334,11 @@ function assignWasmExports(wasmExports) {
   _free_text_format = Module['_free_text_format'] = createExportWrapper('free_text_format', wasmExports['free_text_format'], 1);
   _get_save_file = Module['_get_save_file'] = createExportWrapper('get_save_file', wasmExports['get_save_file'], 0);
   _free_save_file = Module['_free_save_file'] = createExportWrapper('free_save_file', wasmExports['free_save_file'], 1);
+  _get_forced_cells_for_desc = Module['_get_forced_cells_for_desc'] = createExportWrapper('get_forced_cells_for_desc', wasmExports['get_forced_cells_for_desc'], 2);
+  _free_forced_cells = Module['_free_forced_cells'] = createExportWrapper('free_forced_cells', wasmExports['free_forced_cells'], 1);
   _load_game = Module['_load_game'] = createExportWrapper('load_game', wasmExports['load_game'], 0);
   _prefs_load_callback = Module['_prefs_load_callback'] = createExportWrapper('prefs_load_callback', wasmExports['prefs_load_callback'], 2);
+  _set_allowed_shortcuts = Module['_set_allowed_shortcuts'] = createExportWrapper('set_allowed_shortcuts', wasmExports['set_allowed_shortcuts'], 3);
   _main = Module['_main'] = createExportWrapper('__main_argc_argv', wasmExports['__main_argc_argv'], 2);
   _fflush = createExportWrapper('fflush', wasmExports['fflush'], 1);
   _emscripten_stack_get_end = wasmExports['emscripten_stack_get_end'];
@@ -3339,7 +3463,9 @@ var wasmImports = {
   /** @export */
   js_update_key_labels: _js_update_key_labels,
   /** @export */
-  js_update_permalinks: _js_update_permalinks
+  js_update_permalinks: _js_update_permalinks,
+  /** @export */
+  js_update_status: _js_update_status
 };
 
 

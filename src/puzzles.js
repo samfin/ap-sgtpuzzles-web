@@ -9,8 +9,6 @@ const SaveData = require("./savedata.js");
 const {GameSave, getFile, getFileList, openDatabase} = SaveData;
 const {config} = require("config")
 const {genres, genreInfo} = require("./genres.js")
-const KeenProgression = require("./keenProgression.js");
-const {parseSaveFile, reconstructKeenGrid, rewriteSaveFileDesc} = require("./keenSaveFile.js");
 
 document.addEventListener("alpine:init", onInit)
 
@@ -53,6 +51,873 @@ let pendingGameIdResolve = null;
 
 function waitForNextGameId() {
     return new Promise((resolve) => { pendingGameIdResolve = resolve; });
+}
+
+/**
+ * Resolved when the next `getForcedCellsCallback` fires, with the result
+ * string from getForcedCells() below.
+ * @type {((result: string) => void)|null}
+ */
+let pendingForcedCellsResolve = null;
+
+function waitForForcedCells() {
+    return new Promise((resolve) => { pendingForcedCellsResolve = resolve; });
+}
+
+function getForcedCellsCallback(result) {
+    if (pendingForcedCellsResolve) {
+        const resolve = pendingForcedCellsResolve;
+        pendingForcedCellsResolve = null;
+        resolve(result);
+    }
+}
+
+/**
+ * Queries the real Keen solver -- running in the shared puzzleframe's
+ * currently-loaded WASM module, via the get_forced_cells_for_desc/
+ * free_forced_cells native export added for this -- for which cells are
+ * uniquely forced by a partial set of visible clues. This is the actual
+ * solving logic from ap-sgtpuzzles (keen.c's solver()), not a
+ * reimplementation, so its results are exactly what the real game engine
+ * would deduce.
+ *
+ * descStr should be a full Keen descriptor ("<cell-and-cage-structure>,
+ * <clues>" as produced by the WASM module itself) with any cages not yet
+ * meant to be revealed encoded as 'n' (no clue) -- see keen.c's
+ * C_NO_CLUE / encode_clues. paramsStr is the plain "<w>d<e|m>"-style
+ * params string (no genre prefix, no seed/id suffix).
+ *
+ * Requires a Keen puzzle to already be loaded into the shared puzzleframe
+ * (i.e. loadPuzzle("keen") must have run) -- only one puzzle's WASM module
+ * is ever loaded into it at a time, matching every other cross-frame call
+ * in this file. Only one call may be in flight at once, for the same
+ * reason resolveContent() serializes on resolvingEntry.
+ *
+ * @param {string} paramsStr
+ * @param {string} descStr
+ * @returns {Promise<string>} a string of paramsStr's w*w cells, one char
+ *   each in the puzzle's row-major order: a digit for a forced cell, '.'
+ *   for one not yet determined. Empty string if descStr doesn't validate
+ *   against paramsStr.
+ */
+function getForcedCells(paramsStr, descStr) {
+    const resultPromise = waitForForcedCells();
+    sendMessage("getForcedCells", paramsStr, descStr);
+    return resultPromise;
+}
+
+// ---------------------------------------------------------------------
+// Keen descriptor parsing/construction (formerly keenDescriptor.js).
+//
+// Parsing and stage-descriptor construction for Keen puzzle description
+// strings, as produced/consumed by Simon Tatham's Portable Puzzle
+// Collection's `keen.c` (see `encode_block_structure` / `parse_block_structure`
+// / `new_game_desc` / `validate_desc`). This does NOT reimplement any
+// puzzle-solving logic -- it only knows how to turn a Keen descriptor
+// string into a structured {cages} list, and how to turn that back into a
+// *partial* descriptor string with some cages' clues masked out as 'n'
+// (Keen's legitimate "no clue" marker), for progressive reveal.
+//
+// Descriptor format (the part after the ':' in a full puzzle id
+// "<params>:<description>"):
+//
+//   <block-structure-encoding>,<per-cage-clue>*
+// ---------------------------------------------------------------------
+
+/**
+ * Union-find where the representative ("find") of any set is always its
+ * minimum member -- this matches Simon Tatham's `dsf_new_min` semantics,
+ * which `keen.c` relies on to determine cage enumeration order (cages are
+ * emitted, and their clues read back, in order of increasing minimum cell
+ * index).
+ */
+class MinDSF {
+    constructor(n) {
+        this.parent = new Int32Array(n);
+        for (let i = 0; i < n; i++) this.parent[i] = i;
+    }
+
+    find(x) {
+        let root = x;
+        while (this.parent[root] !== root) root = this.parent[root];
+        while (this.parent[x] !== root) {
+            const next = this.parent[x];
+            this.parent[x] = root;
+            x = next;
+        }
+        return root;
+    }
+
+    merge(a, b) {
+        let ra = this.find(a);
+        let rb = this.find(b);
+        if (ra === rb) return;
+        if (ra < rb) {
+            this.parent[rb] = ra;
+        } else {
+            this.parent[ra] = rb;
+        }
+    }
+}
+
+/**
+ * Port of keen.c's parse_block_structure(). Consumes characters from `str`
+ * starting at `pos` until (but not including) the first ',' outside of a
+ * repeat-count run, merging cells in `dsf` accordingly.
+ *
+ * @returns {{dsf: MinDSF, endPos: number}} endPos points at the ',' (or end
+ *   of string, though a valid descriptor always has the comma).
+ */
+function parseBlockStructure(gridWidth, str, pos) {
+    const a = gridWidth * gridWidth;
+    const dsf = new MinDSF(a);
+    const wallSlots = 2 * gridWidth * (gridWidth - 1);
+
+    let i = pos;
+    let slotPos = 0;
+    let repc = 0;
+    let repn = 0;
+
+    while (i < str.length && (repn > 0 || str[i] !== ',')) {
+        let c;
+        if (repn > 0) {
+            repn--;
+            c = repc;
+        } else if (str[i] === '_' || (str[i] >= 'a' && str[i] <= 'z')) {
+            c = str[i] === '_' ? 0 : str.charCodeAt(i) - 'a'.charCodeAt(0) + 1;
+            i++;
+            let numStr = '';
+            while (i < str.length && str[i] >= '0' && str[i] <= '9') {
+                numStr += str[i];
+                i++;
+            }
+            if (numStr) {
+                repc = c;
+                repn = parseInt(numStr, 10) - 1;
+            }
+        } else {
+            throw new Error(`Invalid character in game description at offset ${i}`);
+        }
+
+        const adv = c !== 25; // 'z' is a special case: 25 non-walls, no following wall
+
+        while (c-- > 0) {
+            if (slotPos >= wallSlots) {
+                throw new Error('Too much data in block structure specification');
+            }
+            let p0, p1;
+            if (slotPos < gridWidth * (gridWidth - 1)) {
+                const y = Math.floor(slotPos / (gridWidth - 1));
+                const x = slotPos % (gridWidth - 1);
+                p0 = y * gridWidth + x;
+                p1 = y * gridWidth + x + 1;
+            } else {
+                const x = Math.floor(slotPos / (gridWidth - 1)) - gridWidth;
+                const y = slotPos % (gridWidth - 1);
+                p0 = y * gridWidth + x;
+                p1 = (y + 1) * gridWidth + x;
+            }
+            dsf.merge(p0, p1);
+            slotPos++;
+        }
+        if (adv) {
+            slotPos++;
+            if (slotPos > wallSlots + 1) {
+                throw new Error('Too much data in block structure specification');
+            }
+        }
+    }
+
+    if (slotPos !== wallSlots + 1) {
+        throw new Error('Not enough data in block structure specification');
+    }
+
+    return { dsf, endPos: i };
+}
+
+/**
+ * Builds the ordered cage list (cage j = j-th cell, in increasing index
+ * order, that is the minimum member of its own equivalence class) from a
+ * parsed block-structure DSF. This ordering is exactly the order Keen's
+ * clue list is written in/read from.
+ */
+function cagesFromDsf(dsf, gridWidth) {
+    const a = gridWidth * gridWidth;
+    const rootToCageIndex = new Map();
+    const cages = [];
+
+    for (let i = 0; i < a; i++) {
+        if (dsf.find(i) === i) {
+            rootToCageIndex.set(i, cages.length);
+            cages.push({ cells: [] });
+        }
+    }
+
+    for (let i = 0; i < a; i++) {
+        const cageIdx = rootToCageIndex.get(dsf.find(i));
+        cages[cageIdx].cells.push(i);
+    }
+
+    return cages;
+}
+
+const OP_CHAR_TO_NAME = { a: 'add', s: 'sub', m: 'mul', d: 'div' };
+
+/**
+ * Parses the clue list (the part of the descriptor after the comma),
+ * expecting exactly `numCages` entries, in order.
+ *
+ * @returns {{clueTokens: string[], endPos: number}} clueTokens[j] is the
+ *   raw source text for cage j's clue (e.g. "a7", "n"), preserved verbatim
+ *   so re-emitting an unmodified cage's clue is a byte-for-byte no-op.
+ */
+function parseClueList(str, pos, numCages) {
+    const clueTokens = [];
+    let i = pos;
+
+    for (let k = 0; k < numCages; k++) {
+        const start = i;
+        const opChar = str[i];
+        if (opChar === undefined) {
+            throw new Error('Too few clues for block structure');
+        }
+        i++;
+
+        if (opChar !== 'n') {
+            if (!(opChar in OP_CHAR_TO_NAME)) {
+                throw new Error(`Unrecognised clue type '${opChar}'`);
+            }
+            while (i < str.length && str[i] >= '0' && str[i] <= '9') i++;
+        }
+
+        clueTokens.push(str.slice(start, i));
+    }
+
+    if (i < str.length) {
+        throw new Error('Too many clues for block structure');
+    }
+
+    return { clueTokens, endPos: i };
+}
+
+function clueTokenToOpValue(token) {
+    if (token === 'n') return { op: 'none', value: null };
+    const opChar = token[0];
+    const value = parseInt(token.slice(1), 10);
+    return { op: OP_CHAR_TO_NAME[opChar], value };
+}
+
+/**
+ * Parses a full Keen descriptor (the part after the ':' in a puzzle id) into
+ * a structured cage list plus the raw pieces needed to reconstruct partial
+ * ("some cages hidden") versions of it later.
+ *
+ * @param {number} gridWidth
+ * @param {string} desc - e.g. "a_b3,,a7s2m12..." (block structure, comma,
+ *   clue list)
+ * @returns {{
+ *   cages: {cells: number[], op: string, value: number|null}[],
+ *   blockPart: string,       // includes the trailing comma
+ *   clueTokens: string[],    // raw per-cage clue text, in cage order
+ * }}
+ */
+function parseKeenDescriptor(gridWidth, desc) {
+    const { dsf, endPos: commaPos } = parseBlockStructure(gridWidth, desc, 0);
+    if (desc[commaPos] !== ',') {
+        throw new Error("Expected ',' after block structure description");
+    }
+    const blockPart = desc.slice(0, commaPos + 1);
+
+    const cages = cagesFromDsf(dsf, gridWidth);
+    const { clueTokens, endPos } = parseClueList(desc, commaPos + 1, cages.length);
+
+    if (endPos !== desc.length) {
+        throw new Error('Trailing data after clue list');
+    }
+
+    for (let j = 0; j < cages.length; j++) {
+        const { op, value } = clueTokenToOpValue(clueTokens[j]);
+        if ((op === 'sub' || op === 'div') && cages[j].cells.length !== 2) {
+            throw new Error('Subtraction and division cages must have area 2');
+        }
+        cages[j].op = op;
+        cages[j].value = value;
+    }
+
+    return { cages, blockPart, clueTokens };
+}
+
+/**
+ * Extracts the grid width from a Keen params string (e.g. "6de", "9dxm").
+ * Mirrors keen.c's decode_params: the width is just the leading digits.
+ */
+function parseKeenParamsWidth(paramsStr) {
+    const match = /^(\d+)/.exec(paramsStr);
+    if (!match) throw new Error(`Could not parse grid width from params "${paramsStr}"`);
+    return parseInt(match[1], 10);
+}
+
+/**
+ * Builds a *display* descriptor where every cage not in `activeCageIndices`
+ * has its clue masked out as 'n' (Keen's legitimate "no clue" marker,
+ * understood natively by the game engine/solver). The block structure
+ * (cage shapes) is always fully present -- only which clues are legible
+ * changes across stages.
+ *
+ * @param {string} blockPart - from parseKeenDescriptor
+ * @param {string[]} clueTokens - from parseKeenDescriptor (full/true clues)
+ * @param {Set<number>|number[]} activeCageIndices
+ */
+function buildStageDescriptor(blockPart, clueTokens, activeCageIndices) {
+    const active = activeCageIndices instanceof Set ? activeCageIndices : new Set(activeCageIndices);
+    let clueStr = '';
+    for (let j = 0; j < clueTokens.length; j++) {
+        clueStr += active.has(j) ? clueTokens[j] : 'n';
+    }
+    return blockPart + clueStr;
+}
+
+/**
+ * Convenience wrapper: given a full puzzle id "<params>:<desc>" and the set
+ * of cages that should be visible, returns the puzzle id string for that
+ * stage.
+ */
+function buildStagePuzzleId(paramsStr, blockPart, clueTokens, activeCageIndices) {
+    return `${paramsStr}:${buildStageDescriptor(blockPart, clueTokens, activeCageIndices)}`;
+}
+
+// ---------------------------------------------------------------------
+// Keen save-file parsing/reconstruction (formerly keenSaveFile.js).
+//
+// Parser/reconstructor for the save-file format produced by
+// `get_save_file()` (Simon Tatham midend's `midend_serialise`, see
+// `midend.c`). This lets us read back the *current* grid contents (which
+// definite digits the player has entered so far) purely in JS, with no
+// native/WASM changes -- `get_save_file()` is already exposed and callable
+// at any time via the existing `savePuzzleData()` message round-trip.
+//
+// File format (midend.c's midend_serialise): a sequence of lines, each
+// `<header>:<byte length of content>:<content>\n`. Relevant headers for our
+// purposes:
+//   DESC       - the game description in effect for state 0
+//   NSTATES    - total number of states ever visited (including redoable
+//                "future" ones)
+//   STATEPOS   - 1-indexed index of the CURRENT state (states[statepos-1])
+//   MOVE/SOLVE/RESTART - one per state transition (i=1..nstates-1, in
+//                order), giving the move string that produced state i from
+//                state i-1
+//
+// Only the transitions up to (and not past) STATEPOS are part of the
+// current grid -- anything after that is only reachable via redo.
+// ---------------------------------------------------------------------
+
+/**
+ * Splits raw save-file text into {header, content} records, per the
+ * `<header>:<len>:<content>\n` framing. Uses the declared byte length
+ * rather than splitting on newlines, since content is allowed to contain
+ * anything (including newlines) as long as the length matches.
+ */
+function parseRecords(text) {
+    const records = [];
+    let pos = 0;
+    const n = text.length;
+
+    while (pos < n) {
+        // Skip a lone trailing newline/whitespace at EOF.
+        if (text.slice(pos).trim() === '') break;
+
+        const firstColon = text.indexOf(':', pos);
+        if (firstColon === -1) throw new Error(`Malformed save file: missing ':' after header at offset ${pos}`);
+        const header = text.slice(pos, firstColon).trim();
+
+        const secondColon = text.indexOf(':', firstColon + 1);
+        if (secondColon === -1) throw new Error(`Malformed save file: missing length field for header "${header}"`);
+        const lenStr = text.slice(firstColon + 1, secondColon);
+        const len = parseInt(lenStr, 10);
+        if (!Number.isFinite(len) || len < 0) {
+            throw new Error(`Malformed save file: bad length "${lenStr}" for header "${header}"`);
+        }
+
+        const contentStart = secondColon + 1;
+        const contentEnd = contentStart + len;
+        if (contentEnd > n) throw new Error(`Malformed save file: declared length ${len} for "${header}" exceeds remaining data`);
+        const content = text.slice(contentStart, contentEnd);
+
+        // Expect (and skip) the trailing newline, if present.
+        let next = contentEnd;
+        if (text[next] === '\n') next++;
+        else if (text[next] === '\r' && text[next + 1] === '\n') next += 2;
+
+        records.push({ header, content });
+        pos = next;
+    }
+
+    return records;
+}
+
+/**
+ * Parses a Keen (or generically, any Simon Tatham puzzle) save file into
+ * its structured fields.
+ *
+ * @returns {{
+ *   desc: string|null,
+ *   nstates: number,
+ *   statepos: number,
+ *   transitions: {type: 'MOVE'|'SOLVE'|'RESTART', str: string}[],
+ * }}
+ */
+function parseSaveFile(text) {
+    const records = parseRecords(text);
+
+    let desc = null;
+    let nstates = null;
+    let statepos = null;
+    const transitions = [];
+
+    for (const { header, content } of records) {
+        switch (header) {
+            case 'DESC':
+                desc = content;
+                break;
+            case 'NSTATES':
+                nstates = parseInt(content, 10);
+                break;
+            case 'STATEPOS':
+                statepos = parseInt(content, 10);
+                break;
+            case 'MOVE':
+                transitions.push({ type: 'MOVE', str: content });
+                break;
+            case 'SOLVE':
+                transitions.push({ type: 'SOLVE', str: content });
+                break;
+            case 'RESTART':
+                transitions.push({ type: 'RESTART', str: content });
+                break;
+            default:
+                // Ignore everything else (SAVEFILE, VERSION, GAME, PARAMS,
+                // CPARAMS, SEED/HEXSEED, PRIVDESC, AUXINFO, UI, TIME, ...) --
+                // not needed to reconstruct the grid.
+                break;
+        }
+    }
+
+    if (nstates === null) throw new Error('Save file missing NSTATES');
+    if (statepos === null) throw new Error('Save file missing STATEPOS');
+    if (statepos < 1 || statepos > nstates) {
+        throw new Error(`Save file has out-of-range STATEPOS ${statepos} (NSTATES ${nstates})`);
+    }
+    if (transitions.length !== nstates - 1) {
+        throw new Error(
+            `Save file has ${transitions.length} move transitions but NSTATES=${nstates} implies ${nstates - 1}`
+        );
+    }
+
+    return { desc, nstates, statepos, transitions };
+}
+
+/**
+ * Applies a single 'MOVE'-type move string (Keen's `interpret_move` output:
+ * "R<x>,<y>,<n>" for a definite-digit entry, "P<x>,<y>,<n>" for a pencil
+ * mark) to a mutable grid array. Pencil marks don't affect the definite
+ * grid and are ignored here.
+ */
+function applyKeenMoveString(grid, gridWidth, moveStr) {
+    const kind = moveStr[0];
+    if (kind !== 'R' && kind !== 'P') return; // unrecognised move kind; ignore defensively
+
+    const rest = moveStr.slice(1);
+    const parts = rest.split(',');
+    if (parts.length !== 3) throw new Error(`Malformed Keen move string "${moveStr}"`);
+    const x = parseInt(parts[0], 10);
+    const y = parseInt(parts[1], 10);
+    const n = parseInt(parts[2], 10);
+
+    if (kind === 'R') {
+        if (x < 0 || x >= gridWidth || y < 0 || y >= gridWidth) {
+            throw new Error(`Move string "${moveStr}" out of bounds for width ${gridWidth}`);
+        }
+        grid[y * gridWidth + x] = n; // n === 0 means "cleared"
+    }
+    // 'P' (pencil) moves don't change definite digits.
+}
+
+/**
+ * Applies a 'SOLVE'-type move string. Keen's solve() aux data (and hence
+ * the move string used to apply a full solve) is "S" followed by exactly
+ * w*w digit characters, one per cell in row-major order.
+ */
+function applyKeenSolveString(grid, gridWidth, moveStr) {
+    if (moveStr[0] !== 'S') throw new Error(`Malformed Keen solve string "${moveStr}"`);
+    const digits = moveStr.slice(1);
+    if (digits.length !== gridWidth * gridWidth) {
+        throw new Error(`Solve string has ${digits.length} digits, expected ${gridWidth * gridWidth}`);
+    }
+    for (let i = 0; i < digits.length; i++) {
+        grid[i] = digits.charCodeAt(i) - '0'.charCodeAt(0);
+    }
+}
+
+/**
+ * Reconstructs the current (as of STATEPOS) definite-digit grid for a Keen
+ * puzzle from a parsed save file. Cells with no definite digit entered are
+ * 0.
+ *
+ * @param {number} gridWidth
+ * @param {ReturnType<typeof parseSaveFile>} parsed
+ * @returns {number[]} grid, row-major, length gridWidth*gridWidth
+ */
+function reconstructKeenGrid(gridWidth, parsed) {
+    const a = gridWidth * gridWidth;
+    const grid = new Array(a).fill(0);
+
+    // Only transitions up to (not including) STATEPOS are "current" --
+    // transitions.length === nstates - 1, and transitions[k] is the move
+    // that produced state k+1 from state k. States 0..statepos-1 are
+    // applied, i.e. transitions[0 .. statepos-2].
+    const appliedCount = parsed.statepos - 1;
+
+    for (let k = 0; k < appliedCount; k++) {
+        const { type, str } = parsed.transitions[k];
+        if (type === 'MOVE') {
+            applyKeenMoveString(grid, gridWidth, str);
+        } else if (type === 'SOLVE') {
+            applyKeenSolveString(grid, gridWidth, str);
+        } else if (type === 'RESTART') {
+            grid.fill(0);
+        }
+    }
+
+    return grid;
+}
+
+/**
+ * Rewrites a save file's DESC record to a new descriptor string, leaving
+ * every other record's content byte-for-byte as it was. Used when
+ * advancing a Keen puzzle to a new clue-group stage: the cage shapes and
+ * the player's moves never change across stages, only which clues are
+ * legible, so an existing save can carry straight over onto the new
+ * stage's descriptor.
+ *
+ * IMPORTANT: unlike parseRecords() above (which locates the header by
+ * scanning for the first ':' and so tolerates either form), the real
+ * midend's deserialiser (midend_deserialise_internal in midend.c) does NOT
+ * scan for a colon at all -- it reads a fixed 9-byte field and requires
+ * byte 9 (index 8) to literally be ':'. So every header must be written
+ * left-justified and padded with spaces to exactly 8 characters (matching
+ * midend_serialise's own `wr` macro / copy_left_justified) or a save
+ * rewritten here will fail to load back into the real engine.
+ *
+ * Descriptor strings are always plain ASCII (digits/letters/punctuation),
+ * so string length and byte length coincide here, matching the assumption
+ * already made throughout this save-file handling.
+ *
+ * @param {string} saveText - raw text from get_save_file()/a stored save
+ * @param {string} newDesc - the new stage's descriptor (no "<params>:" prefix)
+ * @returns {string} the rewritten save file text
+ */
+function rewriteSaveFileDesc(saveText, newDesc) {
+    const records = parseRecords(saveText);
+
+    let found = false;
+    let out = '';
+    for (const { header, content } of records) {
+        const paddedHeader = header.padEnd(8, ' ');
+        if (header === 'DESC') {
+            found = true;
+            out += `${paddedHeader}:${newDesc.length}:${newDesc}\n`;
+        } else {
+            out += `${paddedHeader}:${content.length}:${content}\n`;
+        }
+    }
+
+    if (!found) throw new Error('Save file has no DESC record');
+
+    return out;
+}
+
+// ---------------------------------------------------------------------
+// Progressive clue-group planning, built on the real Keen solver
+// (formerly keenSolver.js + keenProgression.js).
+//
+// Given a puzzle's true full descriptor, works out an ordered sequence of
+// clue-group stages: stage k's cages, once visible (along with every
+// earlier stage's), make a new set of cells uniquely forced according to
+// the actual game engine's own solver (queried via getForcedCells(), see
+// above) -- never a local reimplementation of Keen's arithmetic/logic.
+// ---------------------------------------------------------------------
+
+/**
+ * Queries the real solver for exactly the cells forced when only
+ * `activeCageIndices`' clues are visible (every other cage masked as 'n').
+ *
+ * @returns {Promise<Map<number,number>>} cellIndex -> forced digit
+ */
+async function forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activeCageIndices) {
+    const descStr = buildStageDescriptor(blockPart, clueTokens, activeCageIndices);
+    const resultStr = await getForcedCells(paramsStr, descStr);
+
+    const forced = new Map();
+    for (let i = 0; i < resultStr.length; i++) {
+        const ch = resultStr[i];
+        if (ch !== '.') forced.set(i, ch.charCodeAt(0) - '0'.charCodeAt(0));
+    }
+    return forced;
+}
+
+function combosOf(arr, k) {
+    const result = [];
+    const combo = [];
+    const rec = (start) => {
+        if (combo.length === k) { result.push([...combo]); return; }
+        for (let i = start; i < arr.length; i++) {
+            combo.push(arr[i]);
+            rec(i + 1);
+            combo.pop();
+        }
+    };
+    rec(0);
+    return result;
+}
+
+/**
+ * Finds the smallest combination (by combo size, then by fewest newly
+ * forced cells) of not-yet-active cages that, when added, the real solver
+ * forces at least one new cell from. Escalates combo size from 1 up to
+ * maxComboSize; if nothing up to that size makes progress, falls back to
+ * activating everything remaining at once (this always makes progress
+ * against a puzzle that's fully solvable by the real solver with all
+ * clues present).
+ *
+ * Calls are made one at a time (awaited in sequence, never in parallel) --
+ * only one query may be in flight against the shared iframe's WASM module
+ * at once, same as every other cross-frame call in this file.
+ *
+ * @returns {Promise<{cageIndices:number[], newlyForced: Map<number,number>}>}
+ */
+async function findMinimalAddition(paramsStr, blockPart, clueTokens, activeSet, remaining, known, maxComboSize) {
+    const remainingArr = [...remaining];
+
+    for (let k = 1; k <= Math.min(maxComboSize, remainingArr.length); k++) {
+        let best = null;
+        for (const combo of combosOf(remainingArr, k)) {
+            const activeIndices = [...activeSet, ...combo];
+            const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activeIndices);
+            const newlyForced = new Map();
+            for (const [cell, value] of forced) {
+                if (!known.has(cell)) newlyForced.set(cell, value);
+            }
+            if (newlyForced.size > 0) {
+                if (!best || newlyForced.size < best.newlyForced.size) {
+                    best = { cageIndices: combo, newlyForced };
+                }
+            }
+        }
+        if (best) return best;
+    }
+
+    // Fallback: activate everything remaining at once.
+    const activeIndices = [...activeSet, ...remainingArr];
+    const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activeIndices);
+    const newlyForced = new Map();
+    for (const [cell, value] of forced) {
+        if (!known.has(cell)) newlyForced.set(cell, value);
+    }
+    return { cageIndices: remainingArr, newlyForced };
+}
+
+/**
+ * Builds the finest-grained (natural) ordering of a puzzle's cages into
+ * stages, greedily picking the smallest addition that makes progress (per
+ * the real solver) at each step. This is the "maximize the length of the
+ * progression" search.
+ *
+ * @returns {Promise<{cageIndices:number[], newlyForced: Map<number,number>}[]>}
+ *   stages, in reveal order. Concatenating all stages' cageIndices covers
+ *   every cage exactly once, and all stages' newlyForced maps together
+ *   cover the whole grid (the puzzle is fully solved once every stage is
+ *   active) -- assuming the puzzle is solvable by the real solver at all.
+ */
+async function planNaturalStages(paramsStr, blockPart, clueTokens, numCages, maxComboSize) {
+    let active = new Set();
+    let remaining = new Set();
+    for (let i = 0; i < numCages; i++) remaining.add(i);
+    let known = new Map();
+    const stages = [];
+
+    while (remaining.size > 0) {
+        const found = await findMinimalAddition(paramsStr, blockPart, clueTokens, active, remaining, known, maxComboSize);
+        for (const idx of found.cageIndices) {
+            active.add(idx);
+            remaining.delete(idx);
+        }
+        for (const [cell, value] of found.newlyForced) known.set(cell, value);
+
+        if (found.newlyForced.size === 0) {
+            // These cages turned out to be logically redundant given
+            // everything already known (their information was already
+            // implied). Don't give them their own empty stage -- fold them
+            // into the previous one so every stage still represents real
+            // progress. If this is the very first stage, the puzzle can't
+            // be solved by the real solver at all (without guessing).
+            if (stages.length === 0) {
+                throw new Error('Puzzle is not solvable by the real solver without guessing.');
+            }
+            stages[stages.length - 1].cageIndices.push(...found.cageIndices);
+        } else {
+            stages.push(found);
+        }
+    }
+
+    return stages;
+}
+
+/**
+ * Merges adjacent stages (always the pair with the fewest combined newly
+ * forced cells, to keep the remaining stages as evenly sized as possible)
+ * until exactly `target` stages remain. Returns null if `stages` already
+ * has fewer than `target` entries -- the caller should fall back to
+ * clamping, or (during generation) pick a different seed/larger grid.
+ */
+function mergeToTargetCount(stages, target) {
+    if (stages.length < target) return null;
+    if (target < 1) throw new Error('target must be >= 1');
+
+    let result = stages.map((s) => ({
+        cageIndices: [...s.cageIndices],
+        newlyForced: new Map(s.newlyForced),
+    }));
+
+    while (result.length > target) {
+        let bestIdx = 0;
+        let bestSize = Infinity;
+        for (let i = 0; i < result.length - 1; i++) {
+            const size = result[i].newlyForced.size + result[i + 1].newlyForced.size;
+            if (size < bestSize) { bestSize = size; bestIdx = i; }
+        }
+        const merged = {
+            cageIndices: [...result[bestIdx].cageIndices, ...result[bestIdx + 1].cageIndices],
+            newlyForced: new Map([...result[bestIdx].newlyForced, ...result[bestIdx + 1].newlyForced]),
+        };
+        result.splice(bestIdx, 2, merged);
+    }
+
+    return result;
+}
+
+/**
+ * End-to-end: plan the natural stage decomposition for a puzzle (via the
+ * real solver) and merge it down to `targetGroupCount` stages. Returns
+ * null (caller should retry with a different seed/grid, or clamp) if the
+ * puzzle's natural chain is shorter than the target.
+ */
+async function planClueGroups(paramsStr, blockPart, clueTokens, numCages, targetGroupCount, maxComboSize) {
+    const natural = await planNaturalStages(paramsStr, blockPart, clueTokens, numCages, maxComboSize);
+    return mergeToTargetCount(natural, targetGroupCount);
+}
+
+/**
+ * Resolves a Keen puzzle's static content (cages, solution, clue-group
+ * stages) from its true full descriptor (obtained once via a by-seed or
+ * by-id generation pass) and a target digit-group count, using the real
+ * Keen solver (via getForcedCells()) for every solving step.
+ *
+ * @param {string} paramsStr - e.g. "6de"
+ * @param {string} fullDescriptor - the ":"-suffix of a full "<params>:<desc>"
+ *   puzzle id, i.e. just the "<desc>" part, with every cage's real clue
+ *   visible (as freshly generated -- never partially masked).
+ * @param {number} digitGroupCount - target number of stages (from slot
+ *   data's `digit_group_counts[i]`)
+ * @param {number} [maxComboSize]
+ * @returns {Promise<{
+ *   w: number,
+ *   cages: object[],
+ *   blockPart: string,
+ *   clueTokens: string[],
+ *   solution: number[],   // row-major, length w*w
+ *   stages: object[],     // from planClueGroups, length digitGroupCount
+ * }>}
+ */
+async function resolveKeenPuzzle(paramsStr, fullDescriptor, digitGroupCount, maxComboSize = 3) {
+    const w = parseKeenParamsWidth(paramsStr);
+    const { cages, blockPart, clueTokens } = parseKeenDescriptor(w, fullDescriptor);
+
+    const allIndices = cages.map((_, i) => i);
+    const solutionMap = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, allIndices);
+    if (solutionMap.size !== w * w) {
+        throw new Error(
+            `Puzzle is not fully solvable by the real solver (${solutionMap.size}/${w * w} cells) ` +
+            `-- bad seed or unsupported difficulty.`
+        );
+    }
+    const solution = new Array(w * w);
+    for (const [cell, value] of solutionMap) solution[cell] = value;
+
+    const stages = await planClueGroups(paramsStr, blockPart, clueTokens, cages.length, digitGroupCount, maxComboSize);
+    if (!stages) {
+        throw new Error(
+            `Could not plan ${digitGroupCount} clue groups for this puzzle ` +
+            `(grid too small/simple for that many stages) -- pick a different seed or a smaller digit_group_count.`
+        );
+    }
+
+    return { w, cages, blockPart, clueTokens, solution, stages };
+}
+
+/**
+ * Cages visible (i.e. NOT masked as 'n') once `clueSetCount` copies of the
+ * Clue Set item have been received: stages[0..clueSetCount-1]'s cages,
+ * cumulative. clueSetCount 0 => nothing visible (blank puzzle).
+ */
+function activeCageIndicesForCount(stages, clueSetCount) {
+    const active = new Set();
+    const n = Math.max(0, Math.min(clueSetCount, stages.length));
+    for (let k = 0; k < n; k++) {
+        for (const c of stages[k].cageIndices) active.add(c);
+    }
+    return active;
+}
+
+/**
+ * Builds the puzzle id string ("<params>:<descriptor>") for the puzzle as
+ * it should appear once `clueSetCount` Clue Set items have been received.
+ */
+function buildStagePuzzleIdForCount(paramsStr, resolved, clueSetCount) {
+    const active = activeCageIndicesForCount(resolved.stages, clueSetCount);
+    return buildStagePuzzleId(paramsStr, resolved.blockPart, resolved.clueTokens, active);
+}
+
+/**
+ * Given the player's currently-entered grid (0 = blank, matching Keen's own
+ * convention) and a resolved puzzle, returns the list of stage indices
+ * (0-indexed; "Digit Group stageIndex+1") whose target cells are ALL
+ * correctly filled, restricted to stages that are actually reachable at
+ * `clueSetCount` (i.e. stageIndex < clueSetCount) and not already in
+ * `alreadyChecked`.
+ *
+ * @param {object} resolved - from resolveKeenPuzzle
+ * @param {number[]} enteredGrid - row-major, length w*w
+ * @param {number} clueSetCount
+ * @param {Set<number>} alreadyChecked - stage indices already checked; not
+ *   mutated
+ * @returns {number[]} newly-completed stage indices, in ascending order
+ */
+function newlyCompletedStages(resolved, enteredGrid, clueSetCount, alreadyChecked) {
+    const completed = [];
+    const reachable = Math.min(clueSetCount, resolved.stages.length);
+    for (let k = 0; k < reachable; k++) {
+        if (alreadyChecked.has(k)) continue;
+        const stage = resolved.stages[k];
+        let allMatch = true;
+        for (const [cell, value] of stage.newlyForced) {
+            if (enteredGrid[cell] !== value) {
+                allMatch = false;
+                break;
+            }
+        }
+        if (allMatch) completed.push(k);
+    }
+    return completed;
 }
 
 /**
@@ -133,32 +998,23 @@ class ArchipelagoPuzzle {
         if (this._resolvingPromise) return this._resolvingPromise;
 
         this._resolvingPromise = (async () => {
+            // Briefly drive the shared puzzleframe through a hidden load of
+            // this puzzle -- whether it's only known by seed (in which case
+            // this is also how its true full descriptor is captured, via
+            // js_update_permalinks) or already known by exact id. Either
+            // way the "keen" WASM module needs to actually be loaded there
+            // before the getForcedCells() real-solver calls below (inside
+            // resolveKeenPuzzle) have anything to talk to, and it needs to
+            // STAY loaded (hence wrapping the whole computation, not just
+            // this load, in the hidden/resolvingEntry guard) for every one
+            // of those calls, not just the first.
+            resolvingEntry = this;
+            const previousVisibility = puzzleframe.style.visibility;
+            puzzleframe.style.visibility = "hidden";
             try {
-                let gameId;
-
-                if (this.puzzleId) {
-                    // An exact "<params>:<descriptor>" id is already known
-                    // (a Fixed Puzzle specified by id, e.g. "keen:6de:c494")
-                    // -- no need to drive the iframe through a throwaway
-                    // generation pass just to learn it.
-                    gameId = this.puzzleId;
-                } else {
-                    // Only known by seed (or bare params, which loadPuzzle
-                    // turns into a fresh seed) -- briefly generate it in the
-                    // hidden shared iframe to capture its true full
-                    // descriptor via js_update_permalinks.
-                    resolvingEntry = this;
-                    const previousVisibility = puzzleframe.style.visibility;
-                    puzzleframe.style.visibility = "hidden";
-                    try {
-                        const gameIdPromise = waitForNextGameId();
-                        await loadPuzzle(this.genre, this.puzzleSeed, true, undefined);
-                        gameId = await gameIdPromise;
-                    } finally {
-                        puzzleframe.style.visibility = previousVisibility;
-                        resolvingEntry = null;
-                    }
-                }
+                const gameIdPromise = waitForNextGameId();
+                await loadPuzzle(this.genre, this.puzzleId ?? this.puzzleSeed, true, undefined);
+                const gameId = await gameIdPromise;
 
                 const colonIdx = gameId.indexOf(":");
                 if (colonIdx === -1) {
@@ -167,9 +1023,11 @@ class ArchipelagoPuzzle {
                 this.paramsStr = gameId.slice(0, colonIdx);
                 const fullDescriptor = gameId.slice(colonIdx + 1);
 
-                this.resolved = KeenProgression.resolveKeenPuzzle(
+                this.resolved = await resolveKeenPuzzle(
                     this.paramsStr, fullDescriptor, this.digitGroupCount);
             } finally {
+                puzzleframe.style.visibility = previousVisibility;
+                resolvingEntry = null;
                 this._resolvingPromise = null;
             }
             return this.resolved;
@@ -196,7 +1054,7 @@ class ArchipelagoPuzzle {
      */
     async reloadAtCurrentStage() {
         if (!this.resolved) return;
-        this.puzzleId = KeenProgression.buildStagePuzzleIdForCount(
+        this.puzzleId = buildStagePuzzleIdForCount(
             this.paramsStr, this.resolved, this.clueSetCount);
         const stageDescOnly = this.puzzleId.slice(this.paramsStr.length + 1);
 
@@ -219,7 +1077,7 @@ class ArchipelagoPuzzle {
 
     /**
      * Checks the player's currently-entered digits (reconstructed from a
-     * `get_save_file()` round trip, see keenSaveFile.js) against each
+     * `get_save_file()` round trip) against each
      * not-yet-checked, currently-reachable digit group's target cells, and
      * calls client.check() for any that are now fully and correctly filled.
      *
@@ -238,7 +1096,7 @@ class ArchipelagoPuzzle {
             return;
         }
 
-        const newlyCompleted = KeenProgression.newlyCompletedStages(
+        const newlyCompleted = newlyCompletedStages(
             this.resolved, grid, this.clueSetCount, this.checkedStages);
 
         for (const stageIdx of newlyCompleted) {
@@ -928,7 +1786,7 @@ const messageHandlers = {
     js_add_preset, js_add_preset_submenu, js_select_preset,
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
-    savePuzzleDataCallback
+    savePuzzleDataCallback, getForcedCellsCallback
 }
 
 function processMessage(message) {

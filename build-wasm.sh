@@ -3,8 +3,7 @@
 echo "Compiling with cmake"
 cd ap-sgtpuzzles
 set -e
-rm -f CMakeCache.txt
-emcmake cmake -B build-emscripten -DPUZZLES_ENABLE_UNFINISHED=group .
+emcmake cmake -B build-emscripten -DHTML_BUILD_MODE=archipelago .
 cd build-emscripten
 cmake --build .
 cd ../..
@@ -14,10 +13,6 @@ echo "Copying resource files"
 mkdir -p dist/res
 cp -f ap-sgtpuzzles/build-emscripten/*.js dist/res
 cp -f ap-sgtpuzzles/build-emscripten/*.wasm dist/res
-cp -f ap-sgtpuzzles/build-emscripten/unfinished/*.js dist/res
-cp -f ap-sgtpuzzles/build-emscripten/unfinished/*.wasm dist/res
-cp -f ap-sgtpuzzles/build-emscripten/xsheep-puzzles/*.js dist/res
-cp -f ap-sgtpuzzles/build-emscripten/xsheep-puzzles/*.wasm dist/res
 
 mkdir -p dist/help
 if [ -d ap-sgtpuzzles/build-emscripten/help ]; then
