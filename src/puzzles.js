@@ -666,151 +666,45 @@ async function forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activ
 }
 
 /**
- * Lazily yields every k-element combination of arr's elements, in
- * lexicographic (by position) order. Generator rather than a materialized
- * array so a caller that stops early (see findMinimalAddition's per-level
- * candidate cap below) never pays for combinations it never looks at --
- * this matters once arr.length gets into the dozens, where C(n,3) can run
- * into the thousands.
- */
-function* combosOf(arr, k) {
-    const combo = [];
-    function* rec(start) {
-        if (combo.length === k) { yield [...combo]; return; }
-        for (let i = start; i < arr.length; i++) {
-            combo.push(arr[i]);
-            yield* rec(i + 1);
-            combo.pop();
-        }
-    }
-    yield* rec(0);
-}
-
-// Cap on how many same-size combinations findMinimalAddition will probe
-// before giving up on that combo size and escalating. Without this, a
-// large grid (9x9+, several dozen cages) can make the brute-force
-// combination search combinatorially expensive: C(30,3) is already 4060
-// real-solver queries, each a cross-iframe round trip. Combined with
-// ordering candidates by cage size (below), this keeps each stage's
-// planning bounded and fast in practice while still trying a substantial
-// number of candidates before falling back.
-const MAX_CANDIDATES_PER_LEVEL = 100;
-
-/**
- * Queries the real solver for `activeSet` plus the given additional cage
- * indices, and returns just the cells that are forced now but weren't
- * already in `known`. Small helper shared by the combo search and the
- * bisection fallback below.
- */
-async function newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, extraIndices, known) {
-    const activeIndices = [...activeSet, ...extraIndices];
-    const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activeIndices);
-    const newlyForced = new Map();
-    for (const [cell, value] of forced) {
-        if (!known.has(cell)) newlyForced.set(cell, value);
-    }
-    return newlyForced;
-}
-
-/**
- * Finds a set of not-yet-active cages that, when added, the real solver
- * forces at least one new cell from. Two phases:
- *
- * 1. Escalates combo size from 1 up to maxComboSize, trying (a bounded
- *    number of) combinations at each size, smallest-cage-first. This finds
- *    genuinely small forcing sets cheaply when they exist -- a 2-cell
- *    subtraction/division cage, for instance, is often independently
- *    forced on its own.
- * 2. Real Keen puzzles (especially at higher difficulty) routinely need
- *    *most* of their cages visible before propagation forces anything at
- *    all -- there is no small forcing combo to find. Falling straight back
- *    to "activate literally everything remaining" in that case would
- *    collapse the whole rest of the puzzle into one giant final stage
- *    (which is exactly what was observed on a real generated 9x9: every
- *    combo up to size 3 failed, so the very first stage swallowed every
- *    cage). Instead, binary-search over how many of the remaining cages
- *    (in the same smallest-first order) are needed as a PREFIX before
- *    something becomes newly forced. This finds a much smaller "next
- *    breakpoint" than "everything" whenever a smaller one exists, at a
- *    cost of O(log n) solver queries instead of jumping straight to n.
- *    It is not guaranteed to find the *globally* smallest forcing set (it
- *    only searches prefixes of one fixed order, not arbitrary subsets),
- *    but it is far finer-grained than the all-or-nothing fallback it
- *    replaces, and combined with phase 1 running again on every
- *    subsequent call (with a shrunken `remaining` and grown `activeSet`),
- *    it lets a puzzle's natural decomposition keep subdividing instead of
- *    bottoming out after one stage.
- *
- * Within a given combo size, this returns the FIRST combination found to
- * make progress rather than exhaustively searching for the one with the
- * fewest newly forced cells -- for a large cage count, finding the true
- * minimum would mean probing every combination even after already finding
- * a perfectly good one.
- *
- * Calls are made one at a time (awaited in sequence, never in parallel) --
- * only one query may be in flight against the shared iframe's WASM module
- * at once, same as every other cross-frame call in this file.
- *
- * @param {{cells: number[]}[]} cages - full cage list (for size ordering)
- * @returns {Promise<{cageIndices:number[], newlyForced: Map<number,number>}>}
- */
-async function findMinimalAddition(paramsStr, blockPart, clueTokens, activeSet, remaining, known, cages, maxComboSize) {
-    const remainingArr = [...remaining].sort(
-        (a, b) => cages[a].cells.length - cages[b].cells.length || a - b);
-
-    const comboLimit = Math.min(maxComboSize, remainingArr.length);
-    for (let k = 1; k <= comboLimit; k++) {
-        let tried = 0;
-        for (const combo of combosOf(remainingArr, k)) {
-            if (tried++ >= MAX_CANDIDATES_PER_LEVEL) break;
-
-            const newlyForced = await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, combo, known);
-            if (newlyForced.size > 0) {
-                return { cageIndices: combo, newlyForced };
-            }
-        }
-    }
-
-    // Phase 1 already tried the full remaining set as a single "combo" of
-    // size remainingArr.length if that was <= maxComboSize -- in that case
-    // there is nothing smaller left to try, so just report whatever it
-    // found (possibly empty, meaning the real solver can't make any more
-    // progress at all -- handled defensively by the caller).
-    if (comboLimit === remainingArr.length) {
-        const newlyForced = await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, remainingArr, known);
-        return { cageIndices: remainingArr, newlyForced };
-    }
-
-    // Phase 2: binary-search the smallest prefix of remainingArr (beyond
-    // what phase 1 already ruled out) that forces something new. First
-    // confirm activating everything actually helps at all -- if it
-    // doesn't, no prefix will either, and this is the "genuinely stuck"
-    // case (shouldn't happen for a puzzle the real solver can fully solve
-    // with all clues present, but handled defensively).
-    const allNewlyForced = await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, remainingArr, known);
-    if (allNewlyForced.size === 0) {
-        return { cageIndices: remainingArr, newlyForced: allNewlyForced };
-    }
-
-    let lo = comboLimit + 1, hi = remainingArr.length;
-    while (lo < hi) {
-        const mid = lo + Math.floor((hi - lo) / 2);
-        const newlyForced = await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, remainingArr.slice(0, mid), known);
-        if (newlyForced.size > 0) hi = mid; else lo = mid + 1;
-    }
-
-    const prefix = remainingArr.slice(0, hi);
-    const newlyForced = hi === remainingArr.length
-        ? allNewlyForced
-        : await newlyForcedWith(paramsStr, blockPart, clueTokens, activeSet, prefix, known);
-    return { cageIndices: prefix, newlyForced };
-}
-
-/**
  * Builds the finest-grained (natural) ordering of a puzzle's cages into
- * stages, greedily picking the smallest addition that makes progress (per
- * the real solver) at each step. This is the "maximize the length of the
- * progression" search.
+ * stages, by revealing cages one at a time (smallest cage first) and
+ * checking, after each single addition, whether the real solver now
+ * forces any new cell beyond what was already known. Each maximal run of
+ * additions that forces nothing new gets folded into the stage that
+ * follows it (or into the last real stage, if it's a trailing run after
+ * the final cage) -- so a stage boundary falls exactly where new
+ * information actually starts propagating, never before and never
+ * artificially early.
+ *
+ * This replaces an earlier design that searched combinations of
+ * not-yet-active cages (size 1, then 2, then 3, ...) looking for some
+ * subset that alone forced progress, falling back to "reveal everything
+ * remaining at once" if nothing small enough worked. That combinatorial
+ * search cost up to hundreds of real-solver queries *per stage* (each one
+ * a genuine solve) -- and, because real difficulty-tuned Keen puzzles
+ * routinely need most of their cages visible before propagation forces
+ * *anything*, it frequently exhausted every combination it tried anyway.
+ * That made puzzle generation both very slow and prone to collapsing the
+ * whole puzzle into one all-or-nothing stage, which is exactly what was
+ * observed on real generated 9x9 puzzles even after a first attempt at
+ * fixing just the "collapse" symptom with a binary-search fallback (the
+ * fallback still sat behind the same expensive small-combo search, and
+ * for grids with dozens of cages the two together could add up to
+ * thousands of real-solver queries for a single puzzle).
+ *
+ * Revealing strictly one cage at a time instead costs exactly
+ * `cages.length` real-solver queries for the *whole* puzzle's
+ * decomposition (not per stage, and not per combination) -- for a 9x9
+ * with ~35-40 cages, that's ~35-40 queries total rather than potentially
+ * thousands. It is also at least as fine-grained as the old search,
+ * never coarser: since it checks after every single addition rather than
+ * only after a chosen multi-cage combination, it can only find MORE
+ * breakpoints, not fewer, for a small fraction of the cost. A puzzle
+ * still ending up as one giant stage under this scheme means there is
+ * genuinely no proper subset of its cages (smaller than "all of them")
+ * that forces even one cell -- an intrinsic property of that specific
+ * puzzle's logical structure, not something a smarter search could have
+ * found instead.
  *
  * @returns {Promise<{cageIndices:number[], newlyForced: Map<number,number>}[]>}
  *   stages, in reveal order. Concatenating all stages' cageIndices covers
@@ -818,35 +712,45 @@ async function findMinimalAddition(paramsStr, blockPart, clueTokens, activeSet, 
  *   cover the whole grid (the puzzle is fully solved once every stage is
  *   active) -- assuming the puzzle is solvable by the real solver at all.
  */
-async function planNaturalStages(paramsStr, blockPart, clueTokens, cages, maxComboSize) {
-    let active = new Set();
-    let remaining = new Set();
-    for (let i = 0; i < cages.length; i++) remaining.add(i);
-    let known = new Map();
+async function planNaturalStages(paramsStr, blockPart, clueTokens, cages) {
+    const order = [...cages.keys()].sort(
+        (a, b) => cages[a].cells.length - cages[b].cells.length || a - b);
+
+    const active = [];
+    const known = new Map();
     const stages = [];
+    let pendingCageIndices = [];
 
-    while (remaining.size > 0) {
-        const found = await findMinimalAddition(paramsStr, blockPart, clueTokens, active, remaining, known, cages, maxComboSize);
-        for (const idx of found.cageIndices) {
-            active.add(idx);
-            remaining.delete(idx);
-        }
-        for (const [cell, value] of found.newlyForced) known.set(cell, value);
+    for (const idx of order) {
+        active.push(idx);
+        pendingCageIndices.push(idx);
 
-        if (found.newlyForced.size === 0) {
-            // These cages turned out to be logically redundant given
-            // everything already known (their information was already
-            // implied). Don't give them their own empty stage -- fold them
-            // into the previous one so every stage still represents real
-            // progress. If this is the very first stage, the puzzle can't
-            // be solved by the real solver at all (without guessing).
-            if (stages.length === 0) {
-                throw new Error('Puzzle is not solvable by the real solver without guessing.');
-            }
-            stages[stages.length - 1].cageIndices.push(...found.cageIndices);
-        } else {
-            stages.push(found);
+        const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, active);
+        const newlyForced = new Map();
+        for (const [cell, value] of forced) {
+            if (!known.has(cell)) newlyForced.set(cell, value);
         }
+
+        if (newlyForced.size > 0) {
+            for (const [cell, value] of newlyForced) known.set(cell, value);
+            stages.push({ cageIndices: pendingCageIndices, newlyForced });
+            pendingCageIndices = [];
+        }
+    }
+
+    if (pendingCageIndices.length > 0) {
+        // The trailing run of additions (after the last real stage
+        // boundary) forced nothing new by itself -- shouldn't happen for
+        // a puzzle the real solver can fully solve with every clue
+        // present (revealing the very last cage always completes the
+        // grid), but fold defensively into the last real stage rather
+        // than lose track of these cages. If there was no real stage at
+        // all, the puzzle can't be solved by the real solver without
+        // guessing.
+        if (stages.length === 0) {
+            throw new Error('Puzzle is not solvable by the real solver without guessing.');
+        }
+        stages[stages.length - 1].cageIndices.push(...pendingCageIndices);
     }
 
     return stages;
@@ -897,8 +801,8 @@ function mergeToTargetCount(stages, target) {
  * once the whole grid is filled in, so no location becomes permanently
  * unreachable.
  */
-async function planClueGroups(paramsStr, blockPart, clueTokens, cages, targetGroupCount, maxComboSize) {
-    const natural = await planNaturalStages(paramsStr, blockPart, clueTokens, cages, maxComboSize);
+async function planClueGroups(paramsStr, blockPart, clueTokens, cages, targetGroupCount) {
+    const natural = await planNaturalStages(paramsStr, blockPart, clueTokens, cages);
     const merged = mergeToTargetCount(natural, targetGroupCount);
     if (merged) return merged;
 
@@ -922,7 +826,6 @@ async function planClueGroups(paramsStr, blockPart, clueTokens, cages, targetGro
  *   visible (as freshly generated -- never partially masked).
  * @param {number} digitGroupCount - target number of stages (from slot
  *   data's `digit_group_counts[i]`)
- * @param {number} [maxComboSize]
  * @returns {Promise<{
  *   w: number,
  *   cages: object[],
@@ -932,7 +835,7 @@ async function planClueGroups(paramsStr, blockPart, clueTokens, cages, targetGro
  *   stages: object[],     // from planClueGroups, length digitGroupCount
  * }>}
  */
-async function resolveKeenPuzzle(paramsStr, fullDescriptor, digitGroupCount, maxComboSize = 3) {
+async function resolveKeenPuzzle(paramsStr, fullDescriptor, digitGroupCount) {
     const w = parseKeenParamsWidth(paramsStr);
     const { cages, blockPart, clueTokens } = parseKeenDescriptor(w, fullDescriptor);
 
@@ -947,7 +850,7 @@ async function resolveKeenPuzzle(paramsStr, fullDescriptor, digitGroupCount, max
     const solution = new Array(w * w);
     for (const [cell, value] of solutionMap) solution[cell] = value;
 
-    const stages = await planClueGroups(paramsStr, blockPart, clueTokens, cages, digitGroupCount, maxComboSize);
+    const stages = await planClueGroups(paramsStr, blockPart, clueTokens, cages, digitGroupCount);
 
     return { w, cages, blockPart, clueTokens, solution, stages };
 }
@@ -1026,6 +929,28 @@ function newlyCompletedStages(resolved, enteredGrid, clueSetCount, alreadyChecke
         if (allMatch) completed.push(k);
     }
     return completed;
+}
+
+/**
+ * Union of every reachable stage's newlyForced map, up to `clueSetCount`
+ * (capped at resolved.stages.length -- once every real stage is active,
+ * their union already equals the whole solution, same convention as
+ * newlyCompletedStages() above). This is exactly "every cell whose value
+ * already follows logically from the clues currently visible" -- used for
+ * the "highlight next solvable cells" UI option, not just for checking
+ * stage completion.
+ *
+ * @returns {Map<number,number>} cell -> forced digit
+ */
+function cumulativeForcedCells(resolved, clueSetCount) {
+    const known = new Map();
+    const n = Math.max(0, Math.min(clueSetCount, resolved.stages.length));
+    for (let k = 0; k < n; k++) {
+        for (const [cell, value] of resolved.stages[k].newlyForced) {
+            known.set(cell, value);
+        }
+    }
+    return known;
 }
 
 /**
@@ -1193,7 +1118,7 @@ class ArchipelagoPuzzle {
      *   delivered to savePuzzleDataCallback()
      */
     checkStageCompletion(saveFileText) {
-        if (!this.resolved || !isApReady()) return;
+        if (!this.resolved) return;
 
         let grid;
         try {
@@ -1203,6 +1128,13 @@ class ArchipelagoPuzzle {
             console.warn("Failed to parse save file for stage completion check:", e);
             return;
         }
+
+        // Independent of Archipelago connectivity -- this is a solving
+        // aid, not a location check -- so update it even if isApReady()
+        // is false below (e.g. single/freeplay mode).
+        this.updateHintCells(grid);
+
+        if (!isApReady()) return;
 
         const newlyCompleted = newlyCompletedStages(
             this.resolved, grid, this.clueSetCount, this.checkedStages);
@@ -1223,6 +1155,33 @@ class ArchipelagoPuzzle {
             this.updateState();
             Alpine.store("puzzleList").resort();
         }
+    }
+
+    /**
+     * Recomputes and sends the "highlight next solvable cells" set to the
+     * puzzleframe: every currently-empty cell whose value already follows
+     * from the clues visible at this.clueSetCount. Sends an empty set
+     * (clearing any existing highlight) when the "hintMode" preference is
+     * off, or when this isn't the puzzle currently being displayed.
+     *
+     * @param {number[]} enteredGrid - row-major, length w*w, from
+     *   reconstructKeenGrid() (0 = blank)
+     */
+    updateHintCells(enteredGrid) {
+        if (!this.resolved) return;
+        if (Alpine.store("puzzleList").current !== this) return;
+
+        if (!Alpine.store("hintMode")) {
+            sendMessage("setHintCells", this.resolved.w, []);
+            return;
+        }
+
+        const known = cumulativeForcedCells(this.resolved, this.clueSetCount);
+        const hintCells = [];
+        for (const [cell, value] of known) {
+            if (enteredGrid[cell] === 0) hintCells.push(cell);
+        }
+        sendMessage("setHintCells", this.resolved.w, hintCells);
     }
 
     updateDescription() {
@@ -1495,6 +1454,12 @@ function initStores() {
     // A variable to store whether the current puzzle should be played as a fixed puzzle
     // (i.e. disable the Solve button and new game shortcuts)
     Alpine.store("singleMode", false)
+
+    // "Highlight next solvable cells" preference (Keen only): when true,
+    // every currently-empty cell whose value already follows logically
+    // from the visible clues is tinted in the puzzle grid. Persists across
+    // puzzle switches within the session (not reset by resetPuzzleMetadata()).
+    Alpine.store("hintMode", false)
 
     // List of presets for the current puzzle
     // [{id: Int, name: String}]
@@ -1998,6 +1963,23 @@ function dialogCancel() {
 
 function savePuzzleData() {
     sendMessage("savePuzzleData")
+}
+
+/**
+ * Called from the "highlight next solvable cells" checkbox's change
+ * handler. Toggling the preference alone doesn't produce a new move, so
+ * there's nothing that would otherwise trigger ArchipelagoPuzzle's usual
+ * checkStageCompletion()/updateHintCells() round trip -- forcing a fresh
+ * save-file round trip here re-runs it (and immediately clears any
+ * existing highlight when switched off, or recomputes and shows it when
+ * switched on) using the same code path a real move already takes,
+ * rather than duplicating the grid-parsing logic.
+ */
+function onHintModeToggle() {
+    const entry = Alpine.store("puzzleList").current;
+    if (entry instanceof ArchipelagoPuzzle && entry.genre === "keen" && Alpine.store("puzzleState").loaded) {
+        savePuzzleData();
+    }
 }
 
 function setNewGameEnabled(allowNewGame) {
@@ -2704,6 +2686,7 @@ window.setPreset = setPreset;
 window.savePuzzleData = savePuzzleData;
 window.loadPuzzleData = loadPuzzleData;
 window.deletePuzzleData = deletePuzzleData;
+window.onHintModeToggle = onHintModeToggle;
 
 // Expose some variables to global scope for ease of debugging
 window.Alpine = Alpine;

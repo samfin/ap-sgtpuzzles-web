@@ -98,6 +98,14 @@ entry.locked ? 'locked' : 'unlocked', entry.collected ? 'collected' : 'uncollect
                         Solve
                     </button>
                 </div>
+                <template x-if="$store.puzzleState.genre === 'keen'">
+                    <div>
+                        <label>
+                            <input type="checkbox" x-model="$store.hintMode" @change="onHintModeToggle()">
+                            Highlight next solvable cells
+                        </label>
+                    </div>
+                </template>
             </div>
 
             <iframe src="puzzleframe.html" id="puzzleframe" width="500" height="500"></iframe>

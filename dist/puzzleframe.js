@@ -128,13 +128,96 @@ function loadPuzzleData(data) {
     savefile_read_callback = null;
 }
 
+// ---------------------------------------------------------------------
+// "Highlight next solvable cells" overlay -- a set of cell indices the
+// parent wants tinted (currently: cells whose value already follows
+// logically from the visible clues but the player hasn't filled in yet).
+// This is pure DOM/CSS on top of the puzzle canvas, not a native drawing
+// change: #hintoverlay is an absolutely-positioned, pointer-events:none
+// div sitting on top of #puzzlecanvas (see puzzleframe.html), and each
+// highlighted cell gets its own child div positioned/sized to match that
+// cell's on-screen rectangle.
+//
+// Geometry: Keen's own C code (keen.c) draws cell (x,y) at physical-pixel
+// rect [x*TILESIZE+BORDER, y*TILESIZE+BORDER, TILESIZE, TILESIZE] with
+// BORDER = TILESIZE/2, so the whole grid spans (w+1)*TILESIZE physical
+// pixels (when TILESIZE is even, which it normally is) -- i.e. exactly
+// canvas.width (the canvas's physical backing-store size, which is what
+// the native code sizes to). Since CSS-displayed size is just that
+// physical size uniformly scaled by canvas.clientWidth/canvas.width, the
+// same proportions hold in CSS-pixel space: a CSS "tile size" of
+// canvas.clientWidth/(w+1) reproduces the real per-cell rects without
+// needing to know the actual physical tilesize or devicePixelRatio at
+// all. (When TILESIZE is odd this is off by a fraction of a CSS pixel --
+// invisible in practice.)
+// ---------------------------------------------------------------------
+
+let hintGridWidth = 0;
+let hintCellIndices = [];
+let hintResizeObserver = null;
+
+function setHintCells(gridWidth, cellIndices) {
+    hintGridWidth = gridWidth;
+    hintCellIndices = cellIndices || [];
+    ensureHintResizeObserver();
+    renderHintOverlay();
+}
+
+function renderHintOverlay() {
+    const overlay = document.getElementById("hintoverlay");
+    const canvas = document.getElementById("puzzlecanvas");
+    if (!overlay || !canvas) return;
+
+    overlay.innerHTML = "";
+
+    if (!hintGridWidth || hintCellIndices.length === 0 || !canvas.clientWidth) {
+        overlay.style.width = "0px";
+        overlay.style.height = "0px";
+        return;
+    }
+
+    const w = hintGridWidth;
+    const cssSize = canvas.clientWidth; // Keen's grid is always square
+    overlay.style.width = cssSize + "px";
+    overlay.style.height = canvas.clientHeight + "px";
+
+    const tileSize = cssSize / (w + 1);
+    const border = tileSize / 2;
+
+    const fragment = document.createDocumentFragment();
+    for (const cell of hintCellIndices) {
+        const x = cell % w;
+        const y = Math.floor(cell / w);
+        const div = document.createElement("div");
+        div.className = "hint-cell";
+        div.style.left = (x * tileSize + border) + "px";
+        div.style.top = (y * tileSize + border) + "px";
+        div.style.width = tileSize + "px";
+        div.style.height = tileSize + "px";
+        fragment.appendChild(div);
+    }
+    overlay.appendChild(fragment);
+}
+
+// The puzzle canvas can change size (window resize, or dragging
+// #resizehandle) without any message from the parent, so watch it
+// directly rather than relying on being told.
+function ensureHintResizeObserver() {
+    if (hintResizeObserver || typeof ResizeObserver === "undefined") return;
+    const canvas = document.getElementById("puzzlecanvas");
+    if (!canvas) return;
+    hintResizeObserver = new ResizeObserver(() => renderHintOverlay());
+    hintResizeObserver.observe(canvas);
+}
+
 const messageHandlers = {
     loadPuzzle, setPreset, showPreferences,
     puzzleFromId, puzzleFromSeed,
     newPuzzle, restartPuzzle, undoPuzzle, redoPuzzle, solvePuzzle,
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
-    savePuzzleData, loadPuzzleData, getForcedCells
+    savePuzzleData, loadPuzzleData, getForcedCells,
+    setHintCells
 }
 
 function processMessage(message) {

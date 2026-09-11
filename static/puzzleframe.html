@@ -31,12 +31,27 @@ body {
     right: 0px;
 }
 
+#hintoverlay {
+    position: absolute;
+    top: 0px;
+    left: 0px;
+    pointer-events: none;
+}
+
+.hint-cell {
+    position: absolute;
+    background-color: rgba(255, 205, 0, 0.35);
+    box-sizing: border-box;
+    pointer-events: none;
+}
+
     </style>
 </head>
 
 <body>
     <div id="resizable">
         <canvas id="puzzlecanvas" tabindex="0"></canvas>
+        <div id="hintoverlay"></div>
         <svg id="resizehandle" aria-label="resize" width='10' height='10'>
             <title>Drag to resize the puzzle. Right-click to restore the default size.</title>
             <path d='M8.5,1.5l-7,7m7,-4l-4,4m4,-1l-1,1' stroke='currentColor' stroke-linecap='round'></path>
