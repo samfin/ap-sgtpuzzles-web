@@ -3246,8 +3246,8 @@ function checkIncomingModuleAPI() {
 }
 
 // Imports from the Wasm binary.
-var _malloc = Module['_malloc'] = makeInvalidEarlyAccess('_malloc');
 var _free = Module['_free'] = makeInvalidEarlyAccess('_free');
+var _malloc = Module['_malloc'] = makeInvalidEarlyAccess('_malloc');
 var _timer_callback = Module['_timer_callback'] = makeInvalidEarlyAccess('_timer_callback');
 var _rescale_puzzle = Module['_rescale_puzzle'] = makeInvalidEarlyAccess('_rescale_puzzle');
 var _resize_puzzle = Module['_resize_puzzle'] = makeInvalidEarlyAccess('_resize_puzzle');
@@ -3283,8 +3283,8 @@ var __indirect_function_table = makeInvalidEarlyAccess('__indirect_function_tabl
 var wasmMemory = makeInvalidEarlyAccess('wasmMemory');
 
 function assignWasmExports(wasmExports) {
-  assert(typeof wasmExports['malloc'] != 'undefined', 'missing Wasm export: malloc');
   assert(typeof wasmExports['free'] != 'undefined', 'missing Wasm export: free');
+  assert(typeof wasmExports['malloc'] != 'undefined', 'missing Wasm export: malloc');
   assert(typeof wasmExports['timer_callback'] != 'undefined', 'missing Wasm export: timer_callback');
   assert(typeof wasmExports['rescale_puzzle'] != 'undefined', 'missing Wasm export: rescale_puzzle');
   assert(typeof wasmExports['resize_puzzle'] != 'undefined', 'missing Wasm export: resize_puzzle');
@@ -3317,8 +3317,8 @@ function assignWasmExports(wasmExports) {
   assert(typeof wasmExports['emscripten_stack_get_current'] != 'undefined', 'missing Wasm export: emscripten_stack_get_current');
   assert(typeof wasmExports['memory'] != 'undefined', 'missing Wasm export: memory');
   assert(typeof wasmExports['__indirect_function_table'] != 'undefined', 'missing Wasm export: __indirect_function_table');
-  _malloc = Module['_malloc'] = createExportWrapper('malloc', wasmExports['malloc'], 1);
   _free = Module['_free'] = createExportWrapper('free', wasmExports['free'], 1);
+  _malloc = Module['_malloc'] = createExportWrapper('malloc', wasmExports['malloc'], 1);
   _timer_callback = Module['_timer_callback'] = createExportWrapper('timer_callback', wasmExports['timer_callback'], 1);
   _rescale_puzzle = Module['_rescale_puzzle'] = createExportWrapper('rescale_puzzle', wasmExports['rescale_puzzle'], 0);
   _resize_puzzle = Module['_resize_puzzle'] = createExportWrapper('resize_puzzle', wasmExports['resize_puzzle'], 2);
