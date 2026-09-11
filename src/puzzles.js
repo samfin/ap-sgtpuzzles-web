@@ -665,42 +665,72 @@ async function forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activ
     return forced;
 }
 
-function combosOf(arr, k) {
-    const result = [];
+/**
+ * Lazily yields every k-element combination of arr's elements, in
+ * lexicographic (by position) order. Generator rather than a materialized
+ * array so a caller that stops early (see findMinimalAddition's per-level
+ * candidate cap below) never pays for combinations it never looks at --
+ * this matters once arr.length gets into the dozens, where C(n,3) can run
+ * into the thousands.
+ */
+function* combosOf(arr, k) {
     const combo = [];
-    const rec = (start) => {
-        if (combo.length === k) { result.push([...combo]); return; }
+    function* rec(start) {
+        if (combo.length === k) { yield [...combo]; return; }
         for (let i = start; i < arr.length; i++) {
             combo.push(arr[i]);
-            rec(i + 1);
+            yield* rec(i + 1);
             combo.pop();
         }
-    };
-    rec(0);
-    return result;
+    }
+    yield* rec(0);
 }
 
+// Cap on how many same-size combinations findMinimalAddition will probe
+// before giving up on that combo size and escalating. Without this, a
+// large grid (9x9+, several dozen cages) can make the brute-force
+// combination search combinatorially expensive: C(30,3) is already 4060
+// real-solver queries, each a cross-iframe round trip. Combined with
+// ordering candidates by cage size (below), this keeps each stage's
+// planning bounded and fast in practice while still trying a substantial
+// number of candidates before falling back.
+const MAX_CANDIDATES_PER_LEVEL = 100;
+
 /**
- * Finds the smallest combination (by combo size, then by fewest newly
- * forced cells) of not-yet-active cages that, when added, the real solver
- * forces at least one new cell from. Escalates combo size from 1 up to
- * maxComboSize; if nothing up to that size makes progress, falls back to
- * activating everything remaining at once (this always makes progress
+ * Finds a combination of not-yet-active cages that, when added, the real
+ * solver forces at least one new cell from. Escalates combo size from 1 up
+ * to maxComboSize; if nothing up to that size makes progress, falls back
+ * to activating everything remaining at once (this always makes progress
  * against a puzzle that's fully solvable by the real solver with all
  * clues present).
+ *
+ * Within a given combo size, this returns the FIRST combination found to
+ * make progress rather than exhaustively searching for the one with the
+ * fewest newly forced cells -- for a large cage count, finding the true
+ * minimum would mean probing every combination even after already finding
+ * a perfectly good one. To make that first hit come early (and keep
+ * average-case cost low), candidates are tried smallest-cage-first: a
+ * smaller cage (especially a 2-cell subtraction/division cage, which is
+ * tightly constrained) is far more likely to be independently forced than
+ * a large one, so trying those first tends to resolve at k=1 well before
+ * the combo search would otherwise need to escalate.
  *
  * Calls are made one at a time (awaited in sequence, never in parallel) --
  * only one query may be in flight against the shared iframe's WASM module
  * at once, same as every other cross-frame call in this file.
  *
+ * @param {{cells: number[]}[]} cages - full cage list (for size ordering)
  * @returns {Promise<{cageIndices:number[], newlyForced: Map<number,number>}>}
  */
-async function findMinimalAddition(paramsStr, blockPart, clueTokens, activeSet, remaining, known, maxComboSize) {
-    const remainingArr = [...remaining];
+async function findMinimalAddition(paramsStr, blockPart, clueTokens, activeSet, remaining, known, cages, maxComboSize) {
+    const remainingArr = [...remaining].sort(
+        (a, b) => cages[a].cells.length - cages[b].cells.length || a - b);
 
     for (let k = 1; k <= Math.min(maxComboSize, remainingArr.length); k++) {
-        let best = null;
+        let tried = 0;
         for (const combo of combosOf(remainingArr, k)) {
+            if (tried++ >= MAX_CANDIDATES_PER_LEVEL) break;
+
             const activeIndices = [...activeSet, ...combo];
             const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activeIndices);
             const newlyForced = new Map();
@@ -708,12 +738,9 @@ async function findMinimalAddition(paramsStr, blockPart, clueTokens, activeSet, 
                 if (!known.has(cell)) newlyForced.set(cell, value);
             }
             if (newlyForced.size > 0) {
-                if (!best || newlyForced.size < best.newlyForced.size) {
-                    best = { cageIndices: combo, newlyForced };
-                }
+                return { cageIndices: combo, newlyForced };
             }
         }
-        if (best) return best;
     }
 
     // Fallback: activate everything remaining at once.
@@ -738,15 +765,15 @@ async function findMinimalAddition(paramsStr, blockPart, clueTokens, activeSet, 
  *   cover the whole grid (the puzzle is fully solved once every stage is
  *   active) -- assuming the puzzle is solvable by the real solver at all.
  */
-async function planNaturalStages(paramsStr, blockPart, clueTokens, numCages, maxComboSize) {
+async function planNaturalStages(paramsStr, blockPart, clueTokens, cages, maxComboSize) {
     let active = new Set();
     let remaining = new Set();
-    for (let i = 0; i < numCages; i++) remaining.add(i);
+    for (let i = 0; i < cages.length; i++) remaining.add(i);
     let known = new Map();
     const stages = [];
 
     while (remaining.size > 0) {
-        const found = await findMinimalAddition(paramsStr, blockPart, clueTokens, active, remaining, known, maxComboSize);
+        const found = await findMinimalAddition(paramsStr, blockPart, clueTokens, active, remaining, known, cages, maxComboSize);
         for (const idx of found.cageIndices) {
             active.add(idx);
             remaining.delete(idx);
@@ -807,13 +834,27 @@ function mergeToTargetCount(stages, target) {
 
 /**
  * End-to-end: plan the natural stage decomposition for a puzzle (via the
- * real solver) and merge it down to `targetGroupCount` stages. Returns
- * null (caller should retry with a different seed/grid, or clamp) if the
- * puzzle's natural chain is shorter than the target.
+ * real solver) and merge it down to `targetGroupCount` stages. If the
+ * puzzle's natural chain is shorter than the target -- a small/simple grid
+ * can end up fully forced from very little visible information -- falls
+ * back to the natural decomposition as-is (fewer, coarser stages than
+ * requested) rather than failing the puzzle outright. The caller doesn't
+ * need to special-case a short result: newlyCompletedStages() already
+ * treats any digit-group index beyond the actual stage count as completed
+ * once the whole grid is filled in, so no location becomes permanently
+ * unreachable.
  */
-async function planClueGroups(paramsStr, blockPart, clueTokens, numCages, targetGroupCount, maxComboSize) {
-    const natural = await planNaturalStages(paramsStr, blockPart, clueTokens, numCages, maxComboSize);
-    return mergeToTargetCount(natural, targetGroupCount);
+async function planClueGroups(paramsStr, blockPart, clueTokens, cages, targetGroupCount, maxComboSize) {
+    const natural = await planNaturalStages(paramsStr, blockPart, clueTokens, cages, maxComboSize);
+    const merged = mergeToTargetCount(natural, targetGroupCount);
+    if (merged) return merged;
+
+    console.warn(
+        `Keen puzzle only naturally decomposes into ${natural.length} clue group(s) ` +
+        `(requested ${targetGroupCount}) -- using ${natural.length} instead. Any ` +
+        `additional configured digit groups will complete together with the final one.`
+    );
+    return natural;
 }
 
 /**
@@ -853,13 +894,7 @@ async function resolveKeenPuzzle(paramsStr, fullDescriptor, digitGroupCount, max
     const solution = new Array(w * w);
     for (const [cell, value] of solutionMap) solution[cell] = value;
 
-    const stages = await planClueGroups(paramsStr, blockPart, clueTokens, cages.length, digitGroupCount, maxComboSize);
-    if (!stages) {
-        throw new Error(
-            `Could not plan ${digitGroupCount} clue groups for this puzzle ` +
-            `(grid too small/simple for that many stages) -- pick a different seed or a smaller digit_group_count.`
-        );
-    }
+    const stages = await planClueGroups(paramsStr, blockPart, clueTokens, cages, digitGroupCount, maxComboSize);
 
     return { w, cages, blockPart, clueTokens, solution, stages };
 }
@@ -891,9 +926,18 @@ function buildStagePuzzleIdForCount(paramsStr, resolved, clueSetCount) {
  * Given the player's currently-entered grid (0 = blank, matching Keen's own
  * convention) and a resolved puzzle, returns the list of stage indices
  * (0-indexed; "Digit Group stageIndex+1") whose target cells are ALL
- * correctly filled, restricted to stages that are actually reachable at
- * `clueSetCount` (i.e. stageIndex < clueSetCount) and not already in
- * `alreadyChecked`.
+ * correctly filled, restricted to indices reachable at `clueSetCount` (i.e.
+ * index < clueSetCount) and not already in `alreadyChecked`.
+ *
+ * `resolved.stages.length` can be smaller than the configured
+ * digit_group_count (see planClueGroups()'s clamp fallback, for a
+ * small/simple grid whose natural decomposition is shorter than requested).
+ * Any index at or beyond that length has no cage-specific cells of its own
+ * to check -- by construction, every real stage's newlyForced maps together
+ * already cover the whole grid -- so it's treated as completed once the
+ * entire grid matches the puzzle's solution, same moment as the final real
+ * stage. This keeps every configured Digit Group location reachable even
+ * when the puzzle itself only has fewer natural stages.
  *
  * @param {object} resolved - from resolveKeenPuzzle
  * @param {number[]} enteredGrid - row-major, length w*w
@@ -904,15 +948,26 @@ function buildStagePuzzleIdForCount(paramsStr, resolved, clueSetCount) {
  */
 function newlyCompletedStages(resolved, enteredGrid, clueSetCount, alreadyChecked) {
     const completed = [];
-    const reachable = Math.min(clueSetCount, resolved.stages.length);
-    for (let k = 0; k < reachable; k++) {
+    const totalStages = resolved.stages.length;
+    if (totalStages === 0) return completed;
+
+    for (let k = 0; k < clueSetCount; k++) {
         if (alreadyChecked.has(k)) continue;
-        const stage = resolved.stages[k];
+
         let allMatch = true;
-        for (const [cell, value] of stage.newlyForced) {
-            if (enteredGrid[cell] !== value) {
-                allMatch = false;
-                break;
+        if (k < totalStages) {
+            for (const [cell, value] of resolved.stages[k].newlyForced) {
+                if (enteredGrid[cell] !== value) {
+                    allMatch = false;
+                    break;
+                }
+            }
+        } else {
+            for (let cell = 0; cell < resolved.solution.length; cell++) {
+                if (enteredGrid[cell] !== resolved.solution[cell]) {
+                    allMatch = false;
+                    break;
+                }
             }
         }
         if (allMatch) completed.push(k);
