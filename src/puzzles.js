@@ -1149,6 +1149,17 @@ class ArchipelagoPuzzle {
         // `src` concurrently. See syncAPStatus().
         this._reloadChain = Promise.resolve();
 
+        // True once this exact puzzle has been fully loaded into the
+        // shared puzzleframe at least once (i.e. it's the one genuinely
+        // live in there right now, not just the one selected in the UI).
+        // Lets reloadAtCurrentStage() tell "revealing a new clue for the
+        // puzzle already on screen" (no iframe reload needed) apart from
+        // "displaying this puzzle for the first time" (needs the full
+        // reload). Reset to false by puzzleList.selectPuzzle() whenever a
+        // *different* entry becomes current, since the iframe then no
+        // longer shows this one.
+        this._liveInIframe = false;
+
         // Resolved puzzle content (cages/solution/stages), computed once per
         // puzzle via a throwaway by-seed generation pass. See resolveContent().
         this.resolved = null;
@@ -1218,18 +1229,36 @@ class ArchipelagoPuzzle {
     /**
      * (Re)loads this puzzle in the shared puzzleframe at the descriptor
      * matching its current clueSetCount, replaying any existing move data
-     * (via the normal save/load-on-js_post_init path) against it. No-op if
-     * resolveContent() hasn't completed yet.
+     * against it. No-op if resolveContent() hasn't completed yet.
      *
      * If a save already exists for this puzzle, its embedded DESC record
      * (from whatever stage it was last saved at) is rewritten to the
-     * current stage's descriptor first -- otherwise loadPuzzle()'s "don't
-     * bother sending an id if a save exists" shortcut would cause
-     * js_post_init's automatic loadPuzzleData() to reconstruct the puzzle
-     * at its *old*, stale stage instead. The cage shapes never change
-     * across stages (only which clues are visible), and Keen's move format
-     * doesn't depend on clue visibility, so the player's entered digits
-     * carry over exactly.
+     * current stage's descriptor first -- otherwise the "don't bother
+     * sending an id if a save exists" shortcut (see loadPuzzle()) would
+     * reconstruct the puzzle at its *old*, stale stage instead. The cage
+     * shapes never change across stages (only which clues are visible),
+     * and Keen's move format doesn't depend on clue visibility, so the
+     * player's entered digits carry over exactly.
+     *
+     * When this exact puzzle is already the one live in the puzzleframe
+     * (this._liveInIframe -- i.e. a new Clue Set item just arrived for the
+     * puzzle currently on screen, the common case once a session is under
+     * way), the rewritten save is sent straight to the already-running
+     * native engine instead of going through loadPuzzle()'s full iframe
+     * reload: reassigning the iframe's src reinitializes the whole WASM
+     * module from scratch purely to end up calling the exact same
+     * load_game() (native `midend_deserialise`) that already handles
+     * "swap to a new descriptor, replay existing moves" perfectly well on
+     * a live, already-running engine (this is exactly the same call path
+     * a real Simon Tatham build's "Load game" menu command uses against a
+     * live session, with no reinitialization) -- so tearing down and
+     * rebuilding the whole frame first buys nothing but an annoying visible
+     * flash for the player every time a clue arrives.
+     *
+     * Falls back to the full loadPuzzle() reload when this puzzle isn't
+     * already live yet (its first display, via selectPuzzle()) or when
+     * there's no existing save to rewrite in place (nothing entered yet,
+     * so a full reload is harmless, just not worth optimizing).
      */
     async reloadAtCurrentStage() {
         if (!this.resolved) return;
@@ -1238,20 +1267,28 @@ class ArchipelagoPuzzle {
         const stageDescOnly = this.puzzleId.slice(this.paramsStr.length + 1);
 
         const gamesaves = Alpine.store("gamesaves");
+        let rewrittenSave = null;
         if (gamesaves.current) {
             const existingSave = await gamesaves.current.getPuzzleSave(this.index);
             if (existingSave) {
                 try {
-                    const rewritten = rewriteSaveFileDesc(existingSave, stageDescOnly);
-                    await gamesaves.current.setPuzzleSave(this.index, rewritten);
+                    rewrittenSave = rewriteSaveFileDesc(existingSave, stageDescOnly);
+                    await gamesaves.current.setPuzzleSave(this.index, rewrittenSave);
                 } catch (e) {
                     console.warn(`Discarding unreadable save for puzzle ${this.index}:`, e);
                     await gamesaves.current.deletePuzzleSave(this.index);
+                    rewrittenSave = null;
                 }
             }
         }
 
+        if (this._liveInIframe && rewrittenSave !== null) {
+            sendMessage("loadPuzzleData", rewrittenSave);
+            return;
+        }
+
         await loadPuzzle(this.genre, this.puzzleId, true, this.index);
+        this._liveInIframe = true;
     }
 
     /**
@@ -1265,11 +1302,18 @@ class ArchipelagoPuzzle {
      *
      * Implemented by constructing a fresh save file with exactly one MOVE
      * record per already-checked cell (see rewriteSaveFileMoves()) and
-     * reloading from it, rather than issuing the native restart command
-     * and then trying to replay moves into the live session -- the native
+     * loading from it, rather than issuing the native restart command and
+     * then trying to replay moves into the live session -- the native
      * restart command only knows how to reset to a literally blank grid,
-     * with no way to inject moves afterwards other than a fresh save load
-     * (the same mechanism reloadAtCurrentStage() above already relies on).
+     * with no way to inject moves afterwards other than a fresh save load.
+     *
+     * Like reloadAtCurrentStage() above, this sends the rewritten save
+     * straight to the already-running engine (this._liveInIframe) instead
+     * of going through loadPuzzle()'s full iframe reload whenever
+     * possible -- Restart is only ever actionable on the puzzle currently
+     * on screen, so this puzzle is virtually always already live; the full
+     * reload only remains as a fallback for the (essentially unreachable
+     * in practice) case where it somehow isn't.
      */
     async restartToCheckedStages() {
         if (!this.resolved) {
@@ -1298,7 +1342,14 @@ class ArchipelagoPuzzle {
         }
 
         await gamesaves.current.setPuzzleSave(this.index, rewritten);
+
+        if (this._liveInIframe) {
+            sendMessage("loadPuzzleData", rewritten);
+            return;
+        }
+
         await loadPuzzle(this.genre, this.puzzleId, true, this.index);
+        this._liveInIframe = true;
     }
 
     /**
@@ -1521,6 +1572,11 @@ function initStores() {
         sortBySolved: false,
         selectPuzzle(entry) {
             if (!entry) {
+                // The iframe is about to show nothing/something else --
+                // whatever was current is no longer the one live in there.
+                if (this.current instanceof ArchipelagoPuzzle) {
+                    this.current._liveInIframe = false;
+                }
                 this.currentIndex = -1;
                 this.current = null;
                 return;
@@ -1534,6 +1590,13 @@ function initStores() {
 
             if (entry.index == this.currentIndex) {
                 return;
+            }
+
+            // The puzzleframe is about to be pointed at a different puzzle
+            // -- whatever was current is no longer the one live in there
+            // (see ArchipelagoPuzzle._liveInIframe / reloadAtCurrentStage()).
+            if (this.current instanceof ArchipelagoPuzzle && this.current !== entry) {
+                this.current._liveInIframe = false;
             }
 
             this.currentIndex = entry.index;
@@ -2250,13 +2313,16 @@ function syncAPStatus() {
                 dirty = true;
 
                 // If this puzzle is currently open and already resolved,
-                // capture the player's moves and move it to the new stage.
-                // Chained through _reloadChain (rather than called
-                // directly) so that several Clue Set items arriving close
-                // together -- exactly the "multiple clue groups active at
-                // once" scenario -- queue their reloads instead of two
-                // overlapping reloadAtCurrentStage() calls racing to
-                // reassign the shared puzzleframe's src concurrently.
+                // capture the player's moves and move it to the new stage
+                // (reloadAtCurrentStage() does this in place, without a
+                // visible iframe reload, once the puzzle is already live --
+                // see its own doc comment). Chained through _reloadChain
+                // (rather than called directly) so that several Clue Set
+                // items arriving close together -- exactly the "multiple
+                // clue groups active at once" scenario -- queue their
+                // reloads one at a time instead of two overlapping
+                // reloadAtCurrentStage() calls racing on the shared
+                // puzzleframe/native engine concurrently.
                 if (entry === puzzleList.current && entry.resolved) {
                     savePuzzleData();
                     entry._reloadChain = entry._reloadChain.then(
