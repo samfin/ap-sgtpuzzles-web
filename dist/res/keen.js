@@ -250,6 +250,7 @@ var command;
 var get_save_file, free_save_file
 var load_game
 var get_forced_cells_for_desc, free_forced_cells
+var inc_solver_create, inc_solver_reveal_and_snapshot, inc_solver_destroy
 
 // The <form> encapsulating the menus.  Used by
 // js_get_selected_preset() and js_select_preset().
@@ -625,6 +626,12 @@ function initPuzzle() {
     get_forced_cells_for_desc = Module.cwrap('get_forced_cells_for_desc', 'number',
                                               ['string', 'string']);
     free_forced_cells = Module.cwrap('free_forced_cells', 'void', ['number']);
+    inc_solver_create = Module.cwrap('inc_solver_create', 'number',
+                                      ['string', 'string']);
+    inc_solver_reveal_and_snapshot = Module.cwrap(
+        'inc_solver_reveal_and_snapshot', 'number',
+        ['number', 'number', 'number', 'number']);
+    inc_solver_destroy = Module.cwrap('inc_solver_destroy', 'void', ['number']);
 
     if (save_button) save_button.onclick = function(event) {
         if (dlg_dimmer === null) {
@@ -3265,6 +3272,9 @@ var _get_save_file = Module['_get_save_file'] = makeInvalidEarlyAccess('_get_sav
 var _free_save_file = Module['_free_save_file'] = makeInvalidEarlyAccess('_free_save_file');
 var _get_forced_cells_for_desc = Module['_get_forced_cells_for_desc'] = makeInvalidEarlyAccess('_get_forced_cells_for_desc');
 var _free_forced_cells = Module['_free_forced_cells'] = makeInvalidEarlyAccess('_free_forced_cells');
+var _inc_solver_create = Module['_inc_solver_create'] = makeInvalidEarlyAccess('_inc_solver_create');
+var _inc_solver_reveal_and_snapshot = Module['_inc_solver_reveal_and_snapshot'] = makeInvalidEarlyAccess('_inc_solver_reveal_and_snapshot');
+var _inc_solver_destroy = Module['_inc_solver_destroy'] = makeInvalidEarlyAccess('_inc_solver_destroy');
 var _load_game = Module['_load_game'] = makeInvalidEarlyAccess('_load_game');
 var _prefs_load_callback = Module['_prefs_load_callback'] = makeInvalidEarlyAccess('_prefs_load_callback');
 var _set_allowed_shortcuts = Module['_set_allowed_shortcuts'] = makeInvalidEarlyAccess('_set_allowed_shortcuts');
@@ -3302,6 +3312,9 @@ function assignWasmExports(wasmExports) {
   assert(typeof wasmExports['free_save_file'] != 'undefined', 'missing Wasm export: free_save_file');
   assert(typeof wasmExports['get_forced_cells_for_desc'] != 'undefined', 'missing Wasm export: get_forced_cells_for_desc');
   assert(typeof wasmExports['free_forced_cells'] != 'undefined', 'missing Wasm export: free_forced_cells');
+  assert(typeof wasmExports['inc_solver_create'] != 'undefined', 'missing Wasm export: inc_solver_create');
+  assert(typeof wasmExports['inc_solver_reveal_and_snapshot'] != 'undefined', 'missing Wasm export: inc_solver_reveal_and_snapshot');
+  assert(typeof wasmExports['inc_solver_destroy'] != 'undefined', 'missing Wasm export: inc_solver_destroy');
   assert(typeof wasmExports['load_game'] != 'undefined', 'missing Wasm export: load_game');
   assert(typeof wasmExports['prefs_load_callback'] != 'undefined', 'missing Wasm export: prefs_load_callback');
   assert(typeof wasmExports['set_allowed_shortcuts'] != 'undefined', 'missing Wasm export: set_allowed_shortcuts');
@@ -3336,6 +3349,9 @@ function assignWasmExports(wasmExports) {
   _free_save_file = Module['_free_save_file'] = createExportWrapper('free_save_file', wasmExports['free_save_file'], 1);
   _get_forced_cells_for_desc = Module['_get_forced_cells_for_desc'] = createExportWrapper('get_forced_cells_for_desc', wasmExports['get_forced_cells_for_desc'], 2);
   _free_forced_cells = Module['_free_forced_cells'] = createExportWrapper('free_forced_cells', wasmExports['free_forced_cells'], 1);
+  _inc_solver_create = Module['_inc_solver_create'] = createExportWrapper('inc_solver_create', wasmExports['inc_solver_create'], 2);
+  _inc_solver_reveal_and_snapshot = Module['_inc_solver_reveal_and_snapshot'] = createExportWrapper('inc_solver_reveal_and_snapshot', wasmExports['inc_solver_reveal_and_snapshot'], 4);
+  _inc_solver_destroy = Module['_inc_solver_destroy'] = createExportWrapper('inc_solver_destroy', wasmExports['inc_solver_destroy'], 1);
   _load_game = Module['_load_game'] = createExportWrapper('load_game', wasmExports['load_game'], 0);
   _prefs_load_callback = Module['_prefs_load_callback'] = createExportWrapper('prefs_load_callback', wasmExports['prefs_load_callback'], 2);
   _set_allowed_shortcuts = Module['_set_allowed_shortcuts'] = createExportWrapper('set_allowed_shortcuts', wasmExports['set_allowed_shortcuts'], 3);

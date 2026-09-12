@@ -106,6 +106,110 @@ function getForcedCells(paramsStr, descStr) {
     return resultPromise;
 }
 
+let pendingIncCreateResolve = null;
+
+function waitForIncCreate() {
+    return new Promise((resolve) => { pendingIncCreateResolve = resolve; });
+}
+
+function incSolverCreateCallback(handle) {
+    if (pendingIncCreateResolve) {
+        const resolve = pendingIncCreateResolve;
+        pendingIncCreateResolve = null;
+        resolve(handle);
+    }
+}
+
+let pendingIncStepResolve = null;
+
+function waitForIncStep() {
+    return new Promise((resolve) => { pendingIncStepResolve = resolve; });
+}
+
+function incSolverStepCallback(result) {
+    if (pendingIncStepResolve) {
+        const resolve = pendingIncStepResolve;
+        pendingIncStepResolve = null;
+        resolve(result);
+    }
+}
+
+/**
+ * Opens an incremental/warm-start solving session -- running in the
+ * shared puzzleframe's currently-loaded WASM module, via the
+ * inc_solver_create/inc_solver_reveal_and_snapshot/inc_solver_destroy
+ * native exports -- for a puzzle's fixed cage geometry. Lets a caller
+ * reveal that puzzle's cages one at a time, reusing every earlier
+ * reveal's deductions instead of re-solving from scratch each time the
+ * way repeated getForcedCells() calls do (see keen_human_solver.h's
+ * "Incremental / warm-start API" for why this is sound -- this uses
+ * get_forced_cells_human's underlying solver, NOT get_forced_cells's
+ * exact one; see planNaturalStages() below for why that's the right
+ * choice for planning specifically).
+ *
+ * fullDescriptor must have every cage's real clue visible -- only cage
+ * geometry is used to open the session; every cage starts unrevealed
+ * regardless, and which ones end up revealed is controlled entirely by
+ * subsequent incrementalSolverReveal() calls.
+ *
+ * Same "Keen must already be loaded, only one call in flight" caveats
+ * as getForcedCells() apply here too.
+ *
+ * @returns {Promise<number>} an opaque session handle, or 0 if the
+ *   session could not be created (desc didn't validate against
+ *   params).
+ */
+function openIncrementalSolver(paramsStr, fullDescriptor) {
+    const resultPromise = waitForIncCreate();
+    sendMessage("incSolverCreate", paramsStr, fullDescriptor);
+    return resultPromise;
+}
+
+/**
+ * Maps parseKeenDescriptor()'s cage op names to keen.c's small
+ * incremental-API op codes (KEEN_INC_OP_*) -- deliberately not Keen's
+ * internal clue-encoding bit pattern (one of which, C_DIV, doesn't fit
+ * in a plain non-negative int); see keen.c for the mapping this
+ * mirrors.
+ */
+const OP_NAME_TO_INC_CODE = { add: 1, sub: 2, mul: 3, div: 4 };
+
+/**
+ * Reveals cage cageIndex (canonical build_cages() order -- the same
+ * order parseKeenDescriptor()'s cages array already uses) with the
+ * given op/value into an open incremental-solver session, and returns
+ * the resulting forced-cells snapshot in the same cell -> digit Map
+ * format forcedCellsForActiveCages() returns.
+ *
+ * @param {number} handle - from openIncrementalSolver()
+ * @param {number} cageIndex
+ * @param {string} op - one of 'add'/'sub'/'mul'/'div' (parseKeenDescriptor's
+ *   op names; see OP_NAME_TO_INC_CODE)
+ * @param {number} value
+ * @returns {Promise<Map<number,number>|null>} null iff this reveal made
+ *   the session's clue set outright contradictory -- the session
+ *   should not be revealed into again in that case, only passed to
+ *   destroyIncrementalSolver().
+ */
+async function incrementalSolverReveal(handle, cageIndex, op, value) {
+    const resultPromise = waitForIncStep();
+    sendMessage("incSolverRevealAndSnapshot", handle, cageIndex, OP_NAME_TO_INC_CODE[op], value);
+    const resultStr = await resultPromise;
+
+    if (resultStr === '') return null;
+
+    const forced = new Map();
+    for (let i = 0; i < resultStr.length; i++) {
+        const ch = resultStr[i];
+        if (ch !== '.') forced.set(i, ch.charCodeAt(0) - '0'.charCodeAt(0));
+    }
+    return forced;
+}
+
+function destroyIncrementalSolver(handle) {
+    sendMessage("incSolverDestroy", handle);
+}
+
 // ---------------------------------------------------------------------
 // Keen descriptor parsing/construction (formerly keenDescriptor.js).
 //
@@ -730,93 +834,113 @@ async function forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activ
 
 /**
  * Builds the finest-grained (natural) ordering of a puzzle's cages into
- * stages, by revealing cages one at a time (smallest cage first) and
- * checking, after each single addition, whether the real solver now
- * forces any new cell beyond what was already known. Each maximal run of
- * additions that forces nothing new gets folded into the stage that
- * follows it (or into the last real stage, if it's a trailing run after
- * the final cage) -- so a stage boundary falls exactly where new
- * information actually starts propagating, never before and never
- * artificially early.
+ * stages, by revealing cages one at a time (smallest cage first) into a
+ * single incremental/warm-start solving session (see
+ * openIncrementalSolver()/incrementalSolverReveal() above) and checking,
+ * after each single addition, whether it forces any new cell beyond what
+ * was already known. Each maximal run of additions that forces nothing
+ * new gets folded into the stage that follows it (or into the last real
+ * stage, if it's a trailing run after the final cage) -- so a stage
+ * boundary falls exactly where new information actually starts
+ * propagating, never before and never artificially early.
  *
- * This replaces an earlier design that searched combinations of
- * not-yet-active cages (size 1, then 2, then 3, ...) looking for some
- * subset that alone forced progress, falling back to "reveal everything
- * remaining at once" if nothing small enough worked. That combinatorial
- * search cost up to hundreds of real-solver queries *per stage* (each one
- * a genuine solve) -- and, because real difficulty-tuned Keen puzzles
- * routinely need most of their cages visible before propagation forces
- * *anything*, it frequently exhausted every combination it tried anyway.
- * That made puzzle generation both very slow and prone to collapsing the
- * whole puzzle into one all-or-nothing stage, which is exactly what was
- * observed on real generated 9x9 puzzles even after a first attempt at
- * fixing just the "collapse" symptom with a binary-search fallback (the
- * fallback still sat behind the same expensive small-combo search, and
- * for grids with dozens of cages the two together could add up to
- * thousands of real-solver queries for a single puzzle).
+ * Deliberately plans against get_forced_cells_human's solver (via the
+ * incremental API) rather than get_forced_cells's exact one: the exact
+ * solver can prove a cell forced purely by search, with no logical
+ * "reason" a player could ever have found by inspection, which made some
+ * progressive-reveal stages feel like guessing. The human-style solver's
+ * result is always a sound SUBSET of what's exactly forced, so it can
+ * (rarely) fail to force every cell even once every cage is revealed --
+ * resolveKeenPuzzle()'s padFinalStageWithSolution() call, right after
+ * this function returns, folds any such leftover cells into the last
+ * stage using the puzzle's already-verified (via the exact solver)
+ * solution, so a location is always reachable for every cell.
  *
- * Revealing strictly one cage at a time instead costs exactly
- * `cages.length` real-solver queries for the *whole* puzzle's
- * decomposition (not per stage, and not per combination) -- for a 9x9
- * with ~35-40 cages, that's ~35-40 queries total rather than potentially
- * thousands. It is also at least as fine-grained as the old search,
- * never coarser: since it checks after every single addition rather than
- * only after a chosen multi-cage combination, it can only find MORE
- * breakpoints, not fewer, for a small fraction of the cost. A puzzle
- * still ending up as one giant stage under this scheme means there is
- * genuinely no proper subset of its cages (smaller than "all of them")
- * that forces even one cell -- an intrinsic property of that specific
- * puzzle's logical structure, not something a smarter search could have
- * found instead.
+ * This also replaces an earlier design that re-solved the WHOLE puzzle
+ * from scratch (a fresh getForcedCells() call over a rebuilt masked
+ * descriptor) after every single cage addition -- see this project's
+ * progress notes for the combinatorial-search design this itself
+ * replaced, and for the incremental solver's own warm-start
+ * architecture. Revealing cages one at a time into one persistent
+ * session costs exactly `cages.length` incremental solver queries for
+ * the *whole* puzzle's decomposition (not per stage, not per
+ * combination), each one only doing the marginal propagation work its
+ * single new clue requires by reusing every earlier reveal's deductions
+ * -- measured at 3-4x faster than re-solving from scratch per reveal at
+ * w=9 (see keen_human_solver.h's incremental API and the project's
+ * progress notes for the underlying C-level benchmark this is built
+ * on).
  *
  * @returns {Promise<{cageIndices:number[], newlyForced: Map<number,number>}[]>}
  *   stages, in reveal order. Concatenating all stages' cageIndices covers
- *   every cage exactly once, and all stages' newlyForced maps together
- *   cover the whole grid (the puzzle is fully solved once every stage is
- *   active) -- assuming the puzzle is solvable by the real solver at all.
+ *   every cage exactly once. All stages' newlyForced maps together cover
+ *   every cell the human-style solver can pin down with every cage
+ *   revealed -- which may be short of the whole grid (see above);
+ *   resolveKeenPuzzle() tops this up to the whole grid before returning.
  */
 async function planNaturalStages(paramsStr, blockPart, clueTokens, cages) {
     const order = [...cages.keys()].sort(
         (a, b) => cages[a].cells.length - cages[b].cells.length || a - b);
 
-    const active = [];
-    const known = new Map();
-    const stages = [];
-    let pendingCageIndices = [];
-
-    for (const idx of order) {
-        active.push(idx);
-        pendingCageIndices.push(idx);
-
-        const forced = await forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, active);
-        const newlyForced = new Map();
-        for (const [cell, value] of forced) {
-            if (!known.has(cell)) newlyForced.set(cell, value);
-        }
-
-        if (newlyForced.size > 0) {
-            for (const [cell, value] of newlyForced) known.set(cell, value);
-            stages.push({ cageIndices: pendingCageIndices, newlyForced });
-            pendingCageIndices = [];
-        }
+    const fullDescriptor = buildStageDescriptor(blockPart, clueTokens, cages.map((_, i) => i));
+    const handle = await openIncrementalSolver(paramsStr, fullDescriptor);
+    if (!handle) {
+        throw new Error('Failed to open an incremental solver session for planning.');
     }
 
-    if (pendingCageIndices.length > 0) {
-        // The trailing run of additions (after the last real stage
-        // boundary) forced nothing new by itself -- shouldn't happen for
-        // a puzzle the real solver can fully solve with every clue
-        // present (revealing the very last cage always completes the
-        // grid), but fold defensively into the last real stage rather
-        // than lose track of these cages. If there was no real stage at
-        // all, the puzzle can't be solved by the real solver without
-        // guessing.
-        if (stages.length === 0) {
-            throw new Error('Puzzle is not solvable by the real solver without guessing.');
-        }
-        stages[stages.length - 1].cageIndices.push(...pendingCageIndices);
-    }
+    try {
+        const known = new Map();
+        const stages = [];
+        let pendingCageIndices = [];
 
-    return stages;
+        for (const idx of order) {
+            pendingCageIndices.push(idx);
+
+            const cage = cages[idx];
+            const forced = await incrementalSolverReveal(handle, idx, cage.op, cage.value ?? 0);
+            if (forced === null) {
+                throw new Error(
+                    'Incremental solver reported a contradiction while planning ' +
+                    '-- should never happen for a puzzle generated with real, ' +
+                    'consistent clues.'
+                );
+            }
+
+            const newlyForced = new Map();
+            for (const [cell, value] of forced) {
+                if (!known.has(cell)) newlyForced.set(cell, value);
+            }
+
+            if (newlyForced.size > 0) {
+                for (const [cell, value] of newlyForced) known.set(cell, value);
+                stages.push({ cageIndices: pendingCageIndices, newlyForced });
+                pendingCageIndices = [];
+            }
+        }
+
+        if (pendingCageIndices.length > 0) {
+            if (stages.length === 0) {
+                // The human-style solver never forced a single cell, even
+                // with every cage revealed -- pathological (part 11's fuzz
+                // testing found real generated puzzles are essentially
+                // always fully solvable this way), but not fatal: fold
+                // everything into one catch-all stage with an empty
+                // newlyForced map. resolveKeenPuzzle()'s
+                // padFinalStageWithSolution() fills every cell of it in
+                // from the already-verified solution, so the puzzle can
+                // still be played -- this puzzle just ends up with a
+                // single "reveal every clue, then solve the rest yourself"
+                // stage instead of the usual finer-grained decomposition.
+                stages.push({ cageIndices: pendingCageIndices, newlyForced: new Map() });
+            } else {
+                stages[stages.length - 1].cageIndices.push(...pendingCageIndices);
+            }
+        }
+
+        return stages;
+    } finally {
+        destroyIncrementalSolver(handle);
+    }
 }
 
 /**
@@ -878,6 +1002,38 @@ async function planClueGroups(paramsStr, blockPart, clueTokens, cages, targetGro
 }
 
 /**
+ * Ensures every cell is covered by some stage's newlyForced map, by
+ * folding any cells planNaturalStages() never pinned down (a real
+ * possibility now that planning uses get_forced_cells_human's
+ * deliberately incomplete, non-bifurcating deduction rather than
+ * get_forced_cells's exact solver -- see planNaturalStages()'s doc
+ * comment) into the LAST stage, using the puzzle's own already-verified
+ * (via the exact solver, above) full solution. This preserves the
+ * invariant every caller of resolveKeenPuzzle() relies on
+ * (newlyCompletedStages() etc.): every real stage's newlyForced maps
+ * together cover the whole grid, so completing the final stage really
+ * does mean the puzzle is fully solved. A no-op whenever planning
+ * already covered every cell on its own (the common case -- see part
+ * 11's fuzz testing). Mutates and returns `stages`.
+ *
+ * @param {{cageIndices:number[], newlyForced: Map<number,number>}[]} stages
+ * @param {number[]} solution - row-major, length w*w
+ */
+function padFinalStageWithSolution(stages, solution) {
+    const known = new Set();
+    for (const stage of stages) {
+        for (const cell of stage.newlyForced.keys()) known.add(cell);
+    }
+    if (known.size === solution.length) return stages;
+
+    const last = stages[stages.length - 1];
+    for (let cell = 0; cell < solution.length; cell++) {
+        if (!known.has(cell)) last.newlyForced.set(cell, solution[cell]);
+    }
+    return stages;
+}
+
+/**
  * Resolves a Keen puzzle's static content (cages, solution, clue-group
  * stages) from its true full descriptor (obtained once via a by-seed or
  * by-id generation pass) and a target digit-group count, using the real
@@ -914,6 +1070,7 @@ async function resolveKeenPuzzle(paramsStr, fullDescriptor, digitGroupCount) {
     for (const [cell, value] of solutionMap) solution[cell] = value;
 
     const stages = await planClueGroups(paramsStr, blockPart, clueTokens, cages, digitGroupCount);
+    padFinalStageWithSolution(stages, solution);
 
     return { w, cages, blockPart, clueTokens, solution, stages };
 }
@@ -2115,7 +2272,8 @@ const messageHandlers = {
     js_add_preset, js_add_preset_submenu, js_select_preset,
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
-    savePuzzleDataCallback, getForcedCellsCallback
+    savePuzzleDataCallback, getForcedCellsCallback,
+    incSolverCreateCallback, incSolverStepCallback
 }
 
 function processMessage(message) {

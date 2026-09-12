@@ -109,6 +109,25 @@ function getForcedCells(paramsStr, descStr) {
     sendMessage("getForcedCellsCallback", result);
 }
 
+function incSolverCreate(paramsStr, descStr) {
+    // defined in {genre}.js via cwrap (see emccpre-ap.js); only
+    // callable once a genre has actually been loaded via loadPuzzle().
+    var handle = inc_solver_create(paramsStr, descStr);
+    sendMessage("incSolverCreateCallback", handle);
+}
+
+function incSolverRevealAndSnapshot(handle, cageIndex, op, value) {
+    var ptr = inc_solver_reveal_and_snapshot(handle, cageIndex, op, value);
+    var result = UTF8ToString(ptr);
+    free_forced_cells(ptr);
+
+    sendMessage("incSolverStepCallback", result);
+}
+
+function incSolverDestroy(handle) {
+    inc_solver_destroy(handle);
+}
+
 function loadPuzzleData(data) {
     // Encode data as UTF-8 Uint8Array
     let encoder = new TextEncoder();
@@ -221,6 +240,7 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData, getForcedCells,
+    incSolverCreate, incSolverRevealAndSnapshot, incSolverDestroy,
     setHintCells
 }
 
