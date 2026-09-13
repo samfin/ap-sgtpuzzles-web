@@ -251,6 +251,7 @@ var get_save_file, free_save_file
 var load_game
 var get_forced_cells_for_desc, free_forced_cells
 var inc_solver_create, inc_solver_reveal_and_snapshot, inc_solver_destroy
+var inc_solver_save_state, inc_solver_restore_state, inc_solver_free_state
 
 // The <form> encapsulating the menus.  Used by
 // js_get_selected_preset() and js_select_preset().
@@ -632,6 +633,12 @@ function initPuzzle() {
         'inc_solver_reveal_and_snapshot', 'number',
         ['number', 'number', 'number', 'number']);
     inc_solver_destroy = Module.cwrap('inc_solver_destroy', 'void', ['number']);
+    inc_solver_save_state = Module.cwrap('inc_solver_save_state', 'number',
+                                          ['number']);
+    inc_solver_restore_state = Module.cwrap('inc_solver_restore_state', 'void',
+                                             ['number', 'number']);
+    inc_solver_free_state = Module.cwrap('inc_solver_free_state', 'void',
+                                          ['number']);
 
     if (save_button) save_button.onclick = function(event) {
         if (dlg_dimmer === null) {

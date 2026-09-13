@@ -878,9 +878,103 @@ async function forcedCellsForActiveCages(paramsStr, blockPart, clueTokens, activ
  *   revealed -- which may be short of the whole grid (see above);
  *   resolveKeenPuzzle() tops this up to the whole grid before returning.
  */
-async function planNaturalStages(paramsStr, blockPart, clueTokens, cages) {
-    const order = [...cages.keys()].sort(
-        (a, b) => cages[a].cells.length - cages[b].cells.length || a - b);
+/**
+ * Counts the number of distinct unordered digit combinations that satisfy
+ * a cage's arithmetic clue on a grid of width `w`, respecting the Latin-
+ * square constraint only between cells of the cage that actually share a
+ * row or column (cells sharing neither may legally repeat a digit within
+ * the same cage). Deliberately brute-force -- try every 1..w assignment,
+ * filter by the arithmetic, dedupe by sorted-tuple key -- rather than a
+ * closed-form formula per operator, since cages are small and w<=9 makes
+ * the worst case negligible, and correctness for arbitrary cage geometry
+ * is worth far more than the runtime this never actually spends.
+ *
+ * This is the one and only piece of Keen arithmetic reimplemented in JS
+ * anywhere in this codebase -- explicitly never used to decide what's
+ * actually forced (that's still exclusively the real incremental solver's
+ * job), only as a restrictiveness *weight* for ordering cage reveals
+ * during planning.
+ */
+function countCageTuples(cage, w) {
+    const cells = cage.cells;
+    const n = cells.length;
+    const rows = cells.map((c) => Math.floor(c / w));
+    const cols = cells.map((c) => c % w);
+    const assignment = new Array(n);
+    const seen = new Set();
+
+    function satisfies(op, value, digits) {
+        switch (op) {
+            case 'add': return digits.reduce((a, b) => a + b, 0) === value;
+            case 'mul': return digits.reduce((a, b) => a * b, 1) === value;
+            case 'sub':
+                return digits.length === 2 && Math.abs(digits[0] - digits[1]) === value;
+            case 'div': {
+                if (digits.length !== 2) return false;
+                const hi = Math.max(digits[0], digits[1]);
+                const lo = Math.min(digits[0], digits[1]);
+                return lo !== 0 && hi % lo === 0 && hi / lo === value;
+            }
+            default:
+                return digits.length === 1 && digits[0] === value;
+        }
+    }
+
+    function rec(i) {
+        if (i === n) {
+            if (!satisfies(cage.op, cage.value, assignment)) return;
+            seen.add(assignment.slice().sort((a, b) => a - b).join(','));
+            return;
+        }
+        for (let d = 1; d <= w; d++) {
+            let ok = true;
+            for (let j = 0; j < i; j++) {
+                if ((rows[j] === rows[i] || cols[j] === cols[i]) && assignment[j] === d) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+            assignment[i] = d;
+            rec(i + 1);
+        }
+    }
+    rec(0);
+    return seen.size;
+}
+
+async function planNaturalStages(paramsStr, blockPart, clueTokens, cages, w) {
+    const cageRows = cages.map((cage) => [...new Set(cage.cells.map((c) => Math.floor(c / w)))]);
+    const cageCols = cages.map((cage) => [...new Set(cage.cells.map((c) => c % w))]);
+    const cageTuples = cages.map((cage) => countCageTuples(cage, w));
+
+    // Picks the next cage to reveal while growing a batch: prefer one that
+    // shares a row or column with something already visible (an earlier
+    // committed stage's cages, or a cage already added to the current
+    // batch) -- the row/column-locality preference ("favor additional
+    // clues in the same row rather than useless clues in other rows").
+    // Among cages tied on that (most often: every remaining cage, at a
+    // stage's very start), prefer the more restrictive one via
+    // countCageTuples(). Ties broken by index for determinism.
+    function pickNextCage(remaining, batchRows, batchCols) {
+        let best = null;
+        let bestLocal = -1;
+        let bestTuples = Infinity;
+        for (const idx of remaining) {
+            const local = cageRows[idx].some((r) => batchRows.has(r)) ||
+                cageCols[idx].some((c) => batchCols.has(c));
+            const localScore = local ? 1 : 0;
+            const tuples = cageTuples[idx];
+            if (best === null ||
+                localScore > bestLocal ||
+                (localScore === bestLocal && tuples < bestTuples)) {
+                best = idx;
+                bestLocal = localScore;
+                bestTuples = tuples;
+            }
+        }
+        return best;
+    }
 
     const fullDescriptor = buildStageDescriptor(blockPart, clueTokens, cages.map((_, i) => i));
     const handle = await openIncrementalSolver(paramsStr, fullDescriptor);
@@ -891,53 +985,144 @@ async function planNaturalStages(paramsStr, blockPart, clueTokens, cages) {
     try {
         const known = new Map();
         const stages = [];
-        let pendingCageIndices = [];
+        const remaining = new Set(cages.keys());
+        const committedRows = new Set(), committedCols = new Set();
 
-        for (const idx of order) {
-            pendingCageIndices.push(idx);
+        // Checkpoint of the working session's state with exactly every
+        // committed stage's cages revealed -- i.e. "nothing from the
+        // batch currently being built or trimmed has happened yet".
+        // Freed unconditionally in the `finally` below -- whatever
+        // checkpoint `preBatchState` names when the loop exits (normally
+        // or via an exception) is always the one no longer needed, since
+        // every iteration that keeps one alive past its own scope
+        // replaces it with a fresh save first (see the end of the loop
+        // body).
+        let preBatchState = await saveIncrementalSolverState(handle);
 
-            const cage = cages[idx];
-            const forced = await incrementalSolverReveal(handle, idx, cage.op, cage.value ?? 0);
-            if (forced === null) {
-                throw new Error(
-                    'Incremental solver reported a contradiction while planning ' +
-                    '-- should never happen for a puzzle generated with real, ' +
-                    'consistent clues.'
-                );
+        try {
+            while (remaining.size > 0) {
+                // ---- 1. Grow a batch until it forces something new. ----
+                const batch = [];
+                const batchRows = new Set(committedRows), batchCols = new Set(committedCols);
+                let cumulativeForced = new Map();
+
+                for (;;) {
+                    const idx = pickNextCage(remaining, batchRows, batchCols);
+                    remaining.delete(idx);
+                    batch.push(idx);
+                    for (const r of cageRows[idx]) batchRows.add(r);
+                    for (const c of cageCols[idx]) batchCols.add(c);
+
+                    const cage = cages[idx];
+                    const forced = await incrementalSolverReveal(handle, idx, cage.op, cage.value ?? 0);
+                    if (forced === null) {
+                        throw new Error(
+                            'Incremental solver reported a contradiction while planning ' +
+                            '-- should never happen for a puzzle generated with real, ' +
+                            'consistent clues.'
+                        );
+                    }
+
+                    for (const [cell, value] of forced) {
+                        if (!known.has(cell)) cumulativeForced.set(cell, value);
+                    }
+
+                    if (cumulativeForced.size > 0 || remaining.size === 0) break;
+                }
+
+                if (cumulativeForced.size === 0) {
+                    // Ran out of cages without ever forcing anything new --
+                    // only possible for a trailing run after the puzzle's
+                    // final cage (part 11's fuzz testing found real generated
+                    // puzzles are essentially always fully solvable this way,
+                    // but this stays a graceful fallback rather than an
+                    // assumption). Fold into the previous stage, or -- if
+                    // this is the puzzle's very first (and only) batch -- keep
+                    // it as one catch-all stage with an empty newlyForced map.
+                    // resolveKeenPuzzle()'s padFinalStageWithSolution() fills
+                    // every cell of it in from the already-verified solution,
+                    // so the puzzle can still be played -- this puzzle just
+                    // ends up with a single "reveal every clue, then solve
+                    // the rest yourself" stage instead of the usual
+                    // finer-grained decomposition.
+                    if (stages.length === 0) {
+                        stages.push({ cageIndices: batch, newlyForced: new Map() });
+                    } else {
+                        stages[stages.length - 1].cageIndices.push(...batch);
+                    }
+                    break;
+                }
+
+                // ---- 2. Trim the batch to a locally-minimal necessary set. ----
+                // Repeatedly try dropping each cage (testing from a fresh
+                // restore of preBatchState, so a rejected trial never
+                // contaminates the next one) until a full pass removes
+                // nothing -- a fixed point, not just one pass, per this
+                // function's doc comment.
+                let necessary = [...batch];
+                let finalForced = cumulativeForced;
+                let shrunk = true;
+                while (shrunk && necessary.length > 1) {
+                    shrunk = false;
+                    for (let i = 0; i < necessary.length; i++) {
+                        const dropped = necessary[i];
+                        const without = necessary.filter((_, j) => j !== i);
+
+                        await restoreIncrementalSolverState(handle, preBatchState);
+                        let trialForced = new Map();
+                        let ok = true;
+                        for (const idx2 of without) {
+                            const cage2 = cages[idx2];
+                            const f = await incrementalSolverReveal(handle, idx2, cage2.op, cage2.value ?? 0);
+                            if (f === null) { ok = false; break; }
+                            trialForced = f;
+                        }
+
+                        const stillForcesEverything = ok && [...cumulativeForced].every(
+                            ([cell, value]) => trialForced.get(cell) === value);
+
+                        if (stillForcesEverything) {
+                            necessary = without;
+                            finalForced = new Map();
+                            for (const [cell, value] of trialForced) {
+                                if (!known.has(cell)) finalForced.set(cell, value);
+                            }
+                            remaining.add(dropped);
+                            shrunk = true;
+                            break; // restart the scan over the shrunk batch
+                        }
+                    }
+                }
+
+                // Bring the working session back to exactly "every committed
+                // cage plus `necessary`" revealed, discarding whatever the
+                // trim loop's last (possibly rejected) trial left it at, then
+                // checkpoint that as the base for the NEXT stage's batch.
+                await restoreIncrementalSolverState(handle, preBatchState);
+                for (const idx2 of necessary) {
+                    const cage2 = cages[idx2];
+                    await incrementalSolverReveal(handle, idx2, cage2.op, cage2.value ?? 0);
+                }
+                freeIncrementalSolverState(preBatchState);
+                preBatchState = await saveIncrementalSolverState(handle);
+
+                for (const [cell, value] of finalForced) known.set(cell, value);
+                stages.push({ cageIndices: necessary, newlyForced: finalForced });
+                for (const idx2 of necessary) {
+                    for (const r of cageRows[idx2]) committedRows.add(r);
+                    for (const c of cageCols[idx2]) committedCols.add(c);
+                }
             }
 
-            const newlyForced = new Map();
-            for (const [cell, value] of forced) {
-                if (!known.has(cell)) newlyForced.set(cell, value);
-            }
-
-            if (newlyForced.size > 0) {
-                for (const [cell, value] of newlyForced) known.set(cell, value);
-                stages.push({ cageIndices: pendingCageIndices, newlyForced });
-                pendingCageIndices = [];
-            }
+            return stages;
+        } finally {
+            // Whatever checkpoint preBatchState currently names -- the
+            // fresh one saved after the last committed stage on normal
+            // completion, or whatever was live when an exception
+            // propagated out of the loop -- is always safe and correct
+            // to free exactly here, exactly once.
+            freeIncrementalSolverState(preBatchState);
         }
-
-        if (pendingCageIndices.length > 0) {
-            if (stages.length === 0) {
-                // The human-style solver never forced a single cell, even
-                // with every cage revealed -- pathological (part 11's fuzz
-                // testing found real generated puzzles are essentially
-                // always fully solvable this way), but not fatal: fold
-                // everything into one catch-all stage with an empty
-                // newlyForced map. resolveKeenPuzzle()'s
-                // padFinalStageWithSolution() fills every cell of it in
-                // from the already-verified solution, so the puzzle can
-                // still be played -- this puzzle just ends up with a
-                // single "reveal every clue, then solve the rest yourself"
-                // stage instead of the usual finer-grained decomposition.
-                stages.push({ cageIndices: pendingCageIndices, newlyForced: new Map() });
-            } else {
-                stages[stages.length - 1].cageIndices.push(...pendingCageIndices);
-            }
-        }
-
-        return stages;
     } finally {
         destroyIncrementalSolver(handle);
     }
@@ -988,8 +1173,8 @@ function mergeToTargetCount(stages, target) {
  * once the whole grid is filled in, so no location becomes permanently
  * unreachable.
  */
-async function planClueGroups(paramsStr, blockPart, clueTokens, cages, targetGroupCount) {
-    const natural = await planNaturalStages(paramsStr, blockPart, clueTokens, cages);
+async function planClueGroups(paramsStr, blockPart, clueTokens, cages, targetGroupCount, w) {
+    const natural = await planNaturalStages(paramsStr, blockPart, clueTokens, cages, w);
     const merged = mergeToTargetCount(natural, targetGroupCount);
     if (merged) return merged;
 
@@ -1069,7 +1254,7 @@ async function resolveKeenPuzzle(paramsStr, fullDescriptor, digitGroupCount) {
     const solution = new Array(w * w);
     for (const [cell, value] of solutionMap) solution[cell] = value;
 
-    const stages = await planClueGroups(paramsStr, blockPart, clueTokens, cages, digitGroupCount);
+    const stages = await planClueGroups(paramsStr, blockPart, clueTokens, cages, digitGroupCount, w);
     padFinalStageWithSolution(stages, solution);
 
     return { w, cages, blockPart, clueTokens, solution, stages };
@@ -1300,10 +1485,13 @@ class ArchipelagoPuzzle {
         // from scratch from server state.
         this.checkedStages = new Set();
 
-        // Chains reloadAtCurrentStage() calls so overlapping Clue Set
-        // reveals (several arriving close together) reload the shared
-        // puzzleframe one at a time instead of racing to reassign its
-        // `src` concurrently. See syncAPStatus().
+        // Serializes async work syncAPStatus() schedules per-puzzle in
+        // reaction to a Clue Set count change, so several such changes
+        // arriving close together for the same puzzle run one at a time
+        // instead of racing: reloadAtCurrentStage() calls when this puzzle
+        // is the one live in the shared puzzleframe (avoiding two reloads
+        // racing to reassign its `src` concurrently), or a background
+        // stored-save stage-completion check (see below) when it isn't.
         this._reloadChain = Promise.resolve();
 
         // True once this exact puzzle has been fully loaded into the
@@ -1537,6 +1725,22 @@ class ArchipelagoPuzzle {
 
         if (!isApReady()) return;
 
+        this._checkStagesForGrid(grid);
+    }
+
+    /**
+     * Core of checkStageCompletion() above, factored out so it can also be
+     * driven from a puzzle's last-known *stored* save (via
+     * gamesaves.current.getPuzzleSave()) rather than only a fresh
+     * get_save_file() round trip through the live puzzleframe -- see
+     * syncAPStatus()'s background stage-completion check for why this
+     * matters: a puzzle not currently on screen has no live engine to ask,
+     * but its already-solved grid can still need re-checking against a
+     * newly-arrived Clue Set item.
+     *
+     * @param {number[]} grid - row-major entered digits, length w*w
+     */
+    _checkStagesForGrid(grid) {
         const newlyCompleted = newlyCompletedStages(
             this.resolved, grid, this.clueSetCount, this.checkedStages);
 
@@ -2485,6 +2689,49 @@ function syncAPStatus() {
                     savePuzzleData();
                     entry._reloadChain = entry._reloadChain.then(
                         () => entry.reloadAtCurrentStage());
+                } else if (entry.resolved) {
+                    // This puzzle isn't the one live in the shared
+                    // puzzleframe right now, so there's no running engine
+                    // to round-trip a fresh get_save_file() through -- but
+                    // its last-known stored grid can still need re-checking
+                    // against whatever this Clue Set bump just made newly
+                    // reachable. This matters specifically for a puzzle
+                    // whose configured digit_group_count exceeds its
+                    // natural stage count (planClueGroups()'s clamp
+                    // fallback): such a puzzle can be fully, correctly
+                    // solved with FEWER Clue Set items than
+                    // digit_group_count (every real cage already visible),
+                    // so its trailing "virtual" Digit Group locations only
+                    // become reachable once later, independently-granted
+                    // Clue Set items arrive for it -- which can easily
+                    // happen while the player has moved on to a different
+                    // puzzle. Without this, those trailing locations (and
+                    // the items/completion state they carry) would simply
+                    // never get checked, and the puzzle would never be
+                    // marked solved even though every cell is already
+                    // correctly filled in. Reads the puzzle's stored save
+                    // (not the live engine) via gamesaves -- available for
+                    // any puzzle index, not just the currently-displayed
+                    // one -- and reuses the exact same completion logic
+                    // checkStageCompletion() uses for the live path.
+                    entry._reloadChain = entry._reloadChain.then(async () => {
+                        if (!gamesaves.current) return;
+                        const saveFileText = await gamesaves.current.getPuzzleSave(entry.index);
+                        if (!saveFileText) return;
+
+                        let grid;
+                        try {
+                            const parsed = parseSaveFile(saveFileText);
+                            grid = reconstructKeenGrid(entry.resolved.w, parsed);
+                        } catch (e) {
+                            console.warn(
+                                `Failed to parse stored save for Puzzle ${entry.index} ` +
+                                `during background stage-completion check:`, e);
+                            return;
+                        }
+
+                        entry._checkStagesForGrid(grid);
+                    });
                 }
             }
 

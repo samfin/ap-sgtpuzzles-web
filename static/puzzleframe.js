@@ -128,6 +128,21 @@ function incSolverDestroy(handle) {
     inc_solver_destroy(handle);
 }
 
+function incSolverSaveState(handle) {
+    // defined in {genre}.js via cwrap (see emccpre-ap.js); only
+    // callable once a genre has actually been loaded via loadPuzzle().
+    var state = inc_solver_save_state(handle);
+    sendMessage("incSolverSaveStateCallback", state);
+}
+
+function incSolverRestoreState(handle, state) {
+    inc_solver_restore_state(handle, state);
+}
+
+function incSolverFreeState(state) {
+    inc_solver_free_state(state);
+}
+
 function loadPuzzleData(data) {
     // Encode data as UTF-8 Uint8Array
     let encoder = new TextEncoder();
@@ -241,6 +256,7 @@ const messageHandlers = {
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData, getForcedCells,
     incSolverCreate, incSolverRevealAndSnapshot, incSolverDestroy,
+    incSolverSaveState, incSolverRestoreState, incSolverFreeState,
     setHintCells
 }
 
