@@ -1403,7 +1403,14 @@ function loadFileData(file, secretMode) {
     puzzleList.sortBySolved = !isFreeplay;
 
     for (let i = 0; i < file.puzzles.length; i++) {
-        let options = {locked: file.puzzleLocked[i], solved: file.puzzleSolved[i]}
+        // NOTE: sgtkeen has no per-puzzle "unlock" item -- every puzzle is
+        // available to attempt from the start; only individual Digit Groups
+        // within a puzzle are gated by "Puzzle {i+1} Clue Set" items. So we
+        // deliberately ignore file.puzzleLocked here rather than reading a
+        // lock state that has no basis in the real item table (see also
+        // syncAPStatus() below, which has the same legacy assumption baked
+        // into its item/location name lookups).
+        let options = {locked: false, solved: file.puzzleSolved[i]}
 
         let newEntry;
         if (isFreeplay) {
