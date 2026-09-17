@@ -1333,7 +1333,7 @@ async function connectAP(hostname, port, player, password) {
     };
 
     let connectionURL = `${hostname}:${port}`
-    const game = "Simon Tatham's Portable Puzzle Collection"
+    const game = "sgtkeen"
 
     slotData = await client.login(connectionURL, player, game, connectionInfo);
 
@@ -1359,19 +1359,19 @@ function initRemoteSolves() {
 }
 
 function itemIdToName(id) {
-    return client.package.findPackage("Simon Tatham's Portable Puzzle Collection").reverseItemTable[id]
+    return client.package.findPackage("sgtkeen").reverseItemTable[id]
 }
 
 function itemNameToId(name) {
-    return client.package.findPackage("Simon Tatham's Portable Puzzle Collection").itemTable[name]
+    return client.package.findPackage("sgtkeen").itemTable[name]
 }
 
 function locationIdToName(id) {
-    return client.package.findPackage("Simon Tatham's Portable Puzzle Collection").reverseLocationTable[id]
+    return client.package.findPackage("sgtkeen").reverseLocationTable[id]
 }
 
 function locationNameToId(name) {
-    return client.package.findPackage("Simon Tatham's Portable Puzzle Collection").locationTable[name]
+    return client.package.findPackage("sgtkeen").locationTable[name]
 }
 
 function playerIdToName(id) {
