@@ -6,7 +6,8 @@ git commit -am "aaaaaaa"
 git push
 
 cd -
-echo $(pwd)
+
+rm .git/index.lock
 git add *
 git commit -am "bbbbbb"
 git push

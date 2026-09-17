@@ -9,11 +9,25 @@ const SaveData = require("./savedata.js");
 const {GameSave, getFile, getFileList, openDatabase} = SaveData;
 const {config} = require("config")
 const {genres, genreInfo} = require("./genres.js")
+const {parseKeenDescriptor, buildMaskedDescriptor, buildStageDescriptors} = require("./keenDivision.js")
 
 document.addEventListener("alpine:init", onInit)
 
 let puzzleframe;
 let apReady = false;
+
+// Set to the ArchipelagoPuzzle entry currently being resolved (see
+// loadKeenAwarePuzzleEntry() / js_update_permalinks() below) while its
+// real descriptor is being discovered via a throwaway, hidden load --
+// cleared as soon as js_update_permalinks() reads the result back.
+let resolvingKeenEntry = null;
+
+// True for the whole duration of a hidden resolution-pass load (through
+// that pass's own js_post_init() call), so js_canvas_set_size() can keep
+// the iframe at 0x0 and js_post_init() can skip save-restore/enabling
+// controls against a midend that's about to be thrown away. Cleared just
+// before the *next* (real, masked-to-the-player) load is kicked off.
+let suppressNextReveal = false;
 
 /**
  * @type{import("archipelago.js").JSONRecord}
@@ -52,6 +66,18 @@ class ArchipelagoPuzzle {
         this.locked = options.locked ?? false;
         this.item = options.item;
         this.state = "";
+
+        // Target number of clue-group stages for this puzzle (Archipelago's
+        // "N", from slot_data.digit_group_counts); undefined for freeplay
+        // puzzles, which have no progressive-reveal concept at all.
+        this.digitGroupCount = options.digitGroupCount;
+
+        // Cached client-side division plan for this puzzle instance, filled
+        // in once the puzzle's real descriptor is known (see
+        // js_update_permalinks handling) -- { achieved, stages } from
+        // keenDivision.js's buildStageDescriptors(), plus the resolved full
+        // descriptor and grid width it was computed from.
+        this.stagePlan = null;
 
         this.updateDescription();
         this.updateState();
@@ -198,10 +224,8 @@ function initStores() {
 
             this.currentIndex = entry.index;
             this.current = entry;
-            if (entry.puzzleId) {
-                loadPuzzle(entry.genre, entry.puzzleId, true, entry.index);
-            } else if (entry.puzzleSeed) {
-                loadPuzzle(entry.genre, entry.puzzleSeed, true, entry.index);
+            if (entry.puzzleId || entry.puzzleSeed) {
+                loadKeenAwarePuzzleEntry(entry);
             } else {
                 loadPuzzle(entry.genre, "", false);
             }
@@ -500,6 +524,101 @@ function resetPuzzleMetadata() {
     Alpine.store("errorMessage").dismiss();
 }
 
+/**
+ * Number of "Puzzle {index} Clue Set" items received so far for a given
+ * puzzle -- i.e. how many clue groups are unlocked for that puzzle. Per
+ * rules.py, Digit Group 1 itself requires >= 1 copy, so 0 items means 0
+ * clue groups visible (a fully masked puzzle), not "clue group 1 for
+ * free"; the client mirrors that literally rather than special-casing
+ * the first stage.
+ */
+function countReceivedClueSets(index) {
+    if (!isApReady()) return 0;
+    const itemId = itemNameToId(`Puzzle ${index} Clue Set`);
+    if (itemId === undefined) return 0;
+    return client.items.received.filter(e => e.id === itemId).length;
+}
+
+/**
+ * Given a resolved stage plan (see resolveKeenStagePlan) and a count of
+ * unlocked clue groups, the descriptor to actually display: 'n' for every
+ * cage when unlockedCount is 0, otherwise the (achieved-clamped) stage's
+ * cumulative masked descriptor.
+ */
+function keenDescriptorForCount(plan, unlockedCount) {
+    if (unlockedCount <= 0) {
+        return buildMaskedDescriptor(plan.parsed, []);
+    }
+    const stageIndex = Math.min(unlockedCount, plan.achieved) - 1;
+    return plan.stages[stageIndex].descriptor;
+}
+
+/**
+ * Parse a just-resolved full game id (as reported by js_update_permalinks,
+ * "<params>:<descriptor>") and cache this puzzle's clue-group division
+ * plan on the entry, so future loads/reveals for this puzzle instance
+ * never need another hidden WASM resolution pass -- everything from here
+ * on is pure-JS re-masking of the same parsed structure.
+ */
+function resolveKeenStagePlan(entry, gameId) {
+    const colonIndex = gameId.indexOf(':');
+    if (colonIndex === -1) {
+        throw new Error(`Expected a full game id ("params:desc"), got: ${gameId}`);
+    }
+    const paramsStr = gameId.slice(0, colonIndex);
+    const desc = gameId.slice(colonIndex + 1);
+    const widthMatch = /^\d+/.exec(paramsStr);
+    if (!widthMatch) {
+        throw new Error(`Couldn't read grid width from params string: ${paramsStr}`);
+    }
+    const w = parseInt(widthMatch[0], 10);
+
+    const parsed = parseKeenDescriptor(desc, w);
+    const { achieved, stages } = buildStageDescriptors(parsed, entry.digitGroupCount, gameId);
+
+    entry.stagePlan = { paramsStr, w, parsed, achieved, stages };
+}
+
+/**
+ * The full game id to actually hand to loadPuzzle() for an already-resolved
+ * progressive Keen entry: the currently-unlocked cumulative clue set,
+ * re-rendered as a full ("params:desc") descriptor so the WASM module
+ * displays exactly (and only) what the player has earned so far.
+ */
+function keenVisibleId(entry) {
+    const plan = entry.stagePlan;
+    const unlockedCount = isApReady() ? countReceivedClueSets(entry.index) : plan.achieved;
+    return `${plan.paramsStr}:${keenDescriptorForCount(plan, unlockedCount)}`;
+}
+
+/**
+ * Entry point for loading any puzzle that might be a progressive-reveal
+ * Keen puzzle: freeplay puzzles and non-Keen genres load exactly as
+ * before. A Keen puzzle from Archipelago (entry.digitGroupCount is set)
+ * whose real descriptor we don't know yet gets a hidden "resolution"
+ * pass first (see js_update_permalinks below) -- the seed-based id the
+ * server gave us only tells WASM how to *generate* the puzzle, and the
+ * clue-division algorithm needs the actual resulting cages, which only
+ * exist once that generation has happened once.
+ */
+function loadKeenAwarePuzzleEntry(entry) {
+    const isProgressiveKeen = entry.genre === "keen" && entry.digitGroupCount !== undefined;
+
+    if (!isProgressiveKeen) {
+        loadPuzzle(entry.genre, entry.puzzleId || entry.puzzleSeed, true, entry.index);
+        return;
+    }
+
+    if (entry.stagePlan) {
+        loadPuzzle(entry.genre, keenVisibleId(entry), true, entry.index);
+        return;
+    }
+
+    resolvingKeenEntry = entry;
+    suppressNextReveal = true;
+    loadPuzzle(entry.genre, entry.puzzleId || entry.puzzleSeed, true, entry.index);
+}
+
 async function loadPuzzle(genre, id, singleMode, saveKey) {
     let debugLoader = Alpine.store("debugLoader");
     let puzzleState = Alpine.store("puzzleState");
@@ -569,6 +688,13 @@ function js_init_puzzle() {
 }
 
 function js_post_init() {
+    if (suppressNextReveal) {
+        // Hidden resolution pass (see loadKeenAwarePuzzleEntry): this
+        // midend is about to be thrown away and reloaded with the
+        // player's actual currently-unlocked clues, so don't restore/save
+        // progress or enable controls against it.
+        return;
+    }
     loadPuzzleData();
     Alpine.store("puzzleState").loaded = true;
 }
@@ -586,6 +712,32 @@ function js_update_permalinks(gameId, gameSeed) {
     let puzzleState = Alpine.store("puzzleState");
     puzzleState.gameId = gameId;
     puzzleState.gameSeed = gameSeed;
+
+    if (resolvingKeenEntry) {
+        const entry = resolvingKeenEntry;
+        resolvingKeenEntry = null;
+
+        try {
+            resolveKeenStagePlan(entry, gameId);
+        } catch (e) {
+            console.error(`Failed to compute clue-group division for puzzle ${entry.index}`, e);
+        }
+
+        // Deferred so it runs *after* this (hidden) pass's own
+        // js_post_init() -- main() calls update_permalinks() before
+        // js_post_init(), and suppressNextReveal needs to stay true for
+        // the rest of this pass, only flipping for the next one.
+        setTimeout(() => {
+            suppressNextReveal = false;
+            if (entry.stagePlan) {
+                loadPuzzle(entry.genre, keenVisibleId(entry), true, entry.index);
+            } else {
+                // Resolution failed -- fall back to showing the full
+                // puzzle rather than getting stuck on a blank frame.
+                loadPuzzle(entry.genre, entry.puzzleId || entry.puzzleSeed, true, entry.index);
+            }
+        }, 0);
+    }
 }
 
 function js_update_status(newStatus) {
@@ -655,6 +807,11 @@ function js_canvas_remove_statusbar() {
 }
 
 function js_canvas_set_size(w, h) {
+    if (suppressNextReveal) {
+        // Hidden resolution pass -- keep the iframe collapsed so the
+        // player never sees the fully-clued puzzle this pass generates.
+        return;
+    }
     puzzleframe.width = w / window.devicePixelRatio;
     puzzleframe.height = h / window.devicePixelRatio;
 }
@@ -934,7 +1091,8 @@ async function createFile(hostname, port, player, password) {
         password: password,
         puzzles: slotData.puzzles,
         baseSeed: "" + slotData.world_seed,
-        solveTarget: slotData.solve_target
+        solveTarget: slotData.solve_target,
+        digitGroupCounts: slotData.digit_group_counts
     });
 
     await clearPuzzle();
@@ -1410,7 +1568,11 @@ function loadFileData(file, secretMode) {
         // lock state that has no basis in the real item table (see also
         // syncAPStatus() below, which has the same legacy assumption baked
         // into its item/location name lookups).
-        let options = {locked: false, solved: file.puzzleSolved[i]}
+        let options = {
+            locked: false,
+            solved: file.puzzleSolved[i],
+            digitGroupCount: isFreeplay ? undefined : file.digitGroupCounts[i],
+        }
 
         let newEntry;
         if (isFreeplay) {

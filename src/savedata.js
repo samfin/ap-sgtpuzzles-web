@@ -70,6 +70,17 @@ export class GameSave {
         // already-available puzzle) -- default to unlocked.
         this.puzzleLocked = options.puzzleLocked ?? Array(this.puzzles.length).fill(false)
 
+        /**
+         * Target number of clue-group stages ("Digit Group" locations) for
+         * each puzzle, from the Archipelago world's slot_data
+         * (digit_group_counts). This is "N" per puzzle in the
+         * progressive-reveal design; the client-side division algorithm
+         * (keenDivision.js) may achieve fewer (K < N) if a puzzle doesn't
+         * have enough distinct cages to support N stages.
+         * @type {number[]}
+         */
+        this.digitGroupCounts = options.digitGroupCounts ?? Array(this.puzzles.length).fill(1)
+
         this.updateDescription();
     }
 
@@ -179,6 +190,7 @@ export class GameSave {
             puzzles: this.puzzles.slice(),
             puzzleSolved: this.puzzleSolved.slice(),
             puzzleLocked: this.puzzleLocked.slice(),
+            digitGroupCounts: this.digitGroupCounts.slice(),
             solveTarget: this.solveTarget
         };
     }
