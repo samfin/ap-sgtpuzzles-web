@@ -677,13 +677,36 @@ function savePuzzleDataCallback(data) {
     gamesaves.current.setPuzzleSave(puzzleList.current.index, data)
 }
 
+// Ask the puzzleframe what a (possibly partial) params/desc pair already
+// forces, via the game's own unmodified solver (currently implemented
+// only for Keen). Returns a promise resolving to a string of w*w digit
+// characters ('0' = undetermined), or null if the current genre doesn't
+// support this. Only one such request can be in flight at a time, since
+// there is a single shared puzzleframe iframe.
+let pendingForcedDigitsResolve = null;
+
+function getForcedDigitsCallback(result) {
+    if (pendingForcedDigitsResolve) {
+        let resolve = pendingForcedDigitsResolve;
+        pendingForcedDigitsResolve = null;
+        resolve(result);
+    }
+}
+
+function getForcedDigits(paramsStr, desc) {
+    return new Promise((resolve) => {
+        pendingForcedDigitsResolve = resolve;
+        sendMessage("getForcedDigits", paramsStr, desc);
+    });
+}
+
 const messageHandlers = {
     ready: onPuzzleFrameLoad, js_init_puzzle, js_post_init,
     js_update_permalinks, js_enable_undo_redo, js_remove_solve_button, js_update_status, js_update_key_labels,
     js_add_preset, js_add_preset_submenu, js_select_preset,
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
-    savePuzzleDataCallback
+    savePuzzleDataCallback, getForcedDigitsCallback
 }
 
 function processMessage(message) {

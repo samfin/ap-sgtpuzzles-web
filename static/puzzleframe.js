@@ -118,13 +118,32 @@ function loadPuzzleData(data) {
     savefile_read_callback = null;
 }
 
+// Determine what a (possibly partial) params/desc pair already forces,
+// using the game's own unmodified solver. Independent of whichever
+// puzzle is actually loaded/displayed right now -- window.solve_partial_desc
+// is a pure function of its two string arguments.
+function getForcedDigits(paramsStr, desc) {
+    if (typeof solve_partial_desc !== "function") {
+        // Current genre doesn't implement solve_partial (e.g. not Keen).
+        sendMessage("getForcedDigitsCallback", null);
+        return;
+    }
+
+    var ptr = solve_partial_desc(paramsStr, desc); // defined in {genre}.js
+    var result = ptr ? UTF8ToString(ptr) : null;
+    if (ptr) free_solve_partial(ptr);
+
+    sendMessage("getForcedDigitsCallback", result);
+}
+
 const messageHandlers = {
     loadPuzzle, setPreset, showPreferences,
     puzzleFromId, puzzleFromSeed,
     newPuzzle, restartPuzzle, undoPuzzle, redoPuzzle, solvePuzzle,
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
-    savePuzzleData, loadPuzzleData
+    savePuzzleData, loadPuzzleData,
+    getForcedDigits
 }
 
 function processMessage(message) {
