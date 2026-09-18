@@ -308,6 +308,11 @@ function initStores() {
         genreInfo: genreInfo["none"],
         gameId: "",
         gameSeed: "",
+        // Whether the "highlight next digit group" overlay is currently
+        // showing in the puzzleframe iframe (see toggleNextGroupHighlight()).
+        // Reset whenever a new puzzle loads, since a fresh iframe document
+        // never carries the previous one's overlay over.
+        highlightingNextGroup: false,
         reset() {
             this.solved = false;
             this.undoEnabled = false;
@@ -322,6 +327,7 @@ function initStores() {
             this.genreInfo = genreInfo["none"];
             this.gameId = "";
             this.gameSeed = "";
+            this.highlightingNextGroup = false;
         }
     })
 
@@ -1046,6 +1052,51 @@ function solvePuzzle() {
     Alpine.store("puzzleList").markSolved()
 }
 
+/**
+ * Toggle a highlight overlay (drawn in the puzzleframe iframe, on top of
+ * the puzzle canvas) over every cell in the next not-yet-unlocked digit
+ * group -- regardless of whether those cells happen to be filled in or
+ * already correct, since the point is to show the player *where* the
+ * next group of clues will land, not to grade their current progress.
+ *
+ * A no-op for anything that isn't a resolved progressive-reveal Keen
+ * puzzle: freeplay puzzles and other genres never get a stagePlan, a
+ * Keen puzzle whose stagePlan hasn't been resolved yet (still mid
+ * hidden-resolution-pass) doesn't have one either, and a puzzle whose
+ * every digit group is already unlocked has no "next" group to show.
+ */
+function toggleNextGroupHighlight() {
+    const puzzleState = Alpine.store("puzzleState");
+
+    if (puzzleState.highlightingNextGroup) {
+        puzzleState.highlightingNextGroup = false;
+        sendMessage("setDigitGroupHighlight", null);
+        return;
+    }
+
+    const entry = Alpine.store("puzzleList").current;
+    const plan = entry && entry.stagePlan;
+    if (!plan) return;
+
+    const unlockedCount = isApReady() ? countReceivedClueSets(entry.index) : 0;
+    if (unlockedCount >= plan.stages.length) return;
+
+    // stages[k] is cumulative (see keenDivision.js); the *next* digit
+    // group is whatever it adds beyond the last one the player already
+    // has (or beyond nothing, if they don't have any yet).
+    const previousCageIds = unlockedCount > 0 ? plan.stages[unlockedCount - 1].cageIds : new Set();
+    const nextCageIds = plan.stages[unlockedCount].cageIds;
+
+    const cells = [];
+    for (const cageId of nextCageIds) {
+        if (previousCageIds.has(cageId)) continue;
+        for (const cell of plan.parsed.cages.get(cageId).cells) cells.push(cell);
+    }
+
+    puzzleState.highlightingNextGroup = true;
+    sendMessage("setDigitGroupHighlight", cells, plan.w);
+}
+
 function setPreset(id) {
     sendMessage("setPreset", id)
 }
@@ -1744,6 +1795,7 @@ window.restartPuzzle = restartPuzzle;
 window.undoPuzzle = undoPuzzle;
 window.redoPuzzle = redoPuzzle;
 window.solvePuzzle = solvePuzzle;
+window.toggleNextGroupHighlight = toggleNextGroupHighlight;
 window.setPreset = setPreset;
 window.savePuzzleData = savePuzzleData;
 window.loadPuzzleData = loadPuzzleData;

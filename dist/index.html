@@ -93,6 +93,10 @@ entry.locked ? 'locked' : 'unlocked', entry.collected ? 'collected' : 'uncollect
                     <button onclick="restartPuzzle()" :disabled="!$store.puzzleState.loaded">Restart</button>
                     <button onclick="undoPuzzle()" :disabled="!$store.puzzleState.undoEnabled">Undo</button>
                     <button onclick="redoPuzzle()" :disabled="!$store.puzzleState.redoEnabled">Redo</button>
+                    <button onclick="toggleNextGroupHighlight()" :disabled="!$store.puzzleState.loaded"
+                    x-text="$store.puzzleState.highlightingNextGroup ? 'Hide next group' : 'Highlight next group'">
+                        Highlight next group
+                    </button>
                     <button :style="{display: ($store.singleMode && !$store.debugMode) ? 'none' : null}" onclick="solvePuzzle()"
                     x-text="$store.puzzleState.solveEnabled ? 'Solve' : 'Skip'" :disabled="!$store.puzzleState.loaded">
                         Solve

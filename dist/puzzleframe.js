@@ -136,6 +136,40 @@ function getForcedDigits(paramsStr, desc) {
     sendMessage("getForcedDigitsCallback", result);
 }
 
+// Show or clear the "highlight next digit group" overlay (see
+// toggleNextGroupHighlight() in src/puzzles.js, which computes which
+// cells to highlight -- this function only knows how to draw them).
+// `cells` is a flat array of cell indices (row*w + col); passing
+// null/undefined clears the overlay. Cell rectangles are positioned as
+// percentages of the overlay's own box, which always exactly matches
+// the on-screen canvas (see the CSS comment on #digitGroupHighlight in
+// puzzleframe.html) -- this only works because Keen's canvas is always
+// exactly square, (w+1) cell-widths per side (BORDER == TILESIZE/2 on
+// both ends of every row/column -- see keen.c's SIZE()/COORD() macros),
+// so it needs no information from the WASM module at all, and stays
+// correct regardless of zoom, window resizing, or device pixel ratio.
+function setDigitGroupHighlight(cells, w) {
+    const overlay = document.getElementById("digitGroupHighlight");
+    if (!overlay) return;
+
+    overlay.innerHTML = "";
+    if (!cells || !w) return;
+
+    const cellPercent = 100 / (w + 1);
+    for (const cell of cells) {
+        const row = Math.floor(cell / w);
+        const col = cell % w;
+
+        const div = document.createElement("div");
+        div.className = "digit-group-highlight-cell";
+        div.style.left = `${(col + 0.5) * cellPercent}%`;
+        div.style.top = `${(row + 0.5) * cellPercent}%`;
+        div.style.width = `${cellPercent}%`;
+        div.style.height = `${cellPercent}%`;
+        overlay.appendChild(div);
+    }
+}
+
 const messageHandlers = {
     loadPuzzle, setPreset, showPreferences,
     puzzleFromId, puzzleFromSeed,
@@ -143,7 +177,7 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData,
-    getForcedDigits
+    getForcedDigits, setDigitGroupHighlight
 }
 
 function processMessage(message) {
