@@ -1008,6 +1008,7 @@ async function loadPuzzle(genre, id, singleMode, saveKey) {
     // consistent with the default-size message occasionally winning
     // that race instead of the replay).
     if (genre && persistedPuzzleSize) {
+        console.log("[resize-debug] loadPuzzle appending persisted size:", persistedPuzzleSize);
         queryFragments.push({key: "rw", value: String(persistedPuzzleSize.w)});
         queryFragments.push({key: "rh", value: String(persistedPuzzleSize.h)});
     }
@@ -1190,6 +1191,9 @@ function js_canvas_remove_statusbar() {
 }
 
 function js_canvas_set_size(w, h) {
+    console.log("[resize-debug] parent js_canvas_set_size received:",
+        {w, h, dpr: window.devicePixelRatio, suppressNextReveal,
+         resultW: w / window.devicePixelRatio, resultH: h / window.devicePixelRatio});
     if (suppressNextReveal) {
         // Hidden resolution pass -- keep the iframe collapsed so the
         // player never sees the fully-clued puzzle this pass generates.

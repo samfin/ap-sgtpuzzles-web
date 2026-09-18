@@ -958,6 +958,7 @@ function initPuzzle() {
                 var dpr = window.devicePixelRatio || 1;
                 var new_w = (event.pageX + resize_xoffset - resize_xbase) * dpr * 2;
                 var new_h = (event.pageY + resize_yoffset - resize_ybase) * dpr;
+                console.log("[resize-debug] live drag captured:", {new_w, new_h, dpr});
                 resize_puzzle(new_w, new_h);
                 // Let the parent page know the raw size that was just
                 // applied, in the same units resize_puzzle() itself
@@ -1058,6 +1059,9 @@ function post_init() {
     // (set by the parent's loadPuzzle() -- see persistedPuzzleSize
     // there), rather than sent as a message, specifically so they're
     // available synchronously here with no round trip at all.
+    console.log("[resize-debug] post_init applying persisted size:",
+                {resizeW, resizeH, dpr: window.devicePixelRatio,
+                 hasResizePuzzle: typeof resize_puzzle === "function"});
     if (typeof resize_puzzle === "function" &&
         resizeW !== null && resizeH !== null) {
         resize_puzzle(resizeW, resizeH);
