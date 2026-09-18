@@ -116,6 +116,13 @@ function loadPuzzleData(data) {
     }
     load_game(); // defined in {genre}.js
     savefile_read_callback = null;
+
+    // Let the parent know the restore has actually landed (load_game()
+    // above is synchronous), so it can safely run any post-restore
+    // logic that depends on the restored state actually being live --
+    // e.g. checking whether a progressive Keen puzzle's clue set needs
+    // catching up to clues unlocked since this save was made.
+    sendMessage("loadPuzzleDataCallback");
 }
 
 // Determine what a (possibly partial) params/desc pair already forces,

@@ -9,7 +9,7 @@ const SaveData = require("./savedata.js");
 const {GameSave, getFile, getFileList, openDatabase} = SaveData;
 const {config} = require("config")
 const {genres, genreInfo} = require("./genres.js")
-const {parseKeenDescriptor, buildMaskedDescriptor, touchingCagesByLine, rowColStartCandidates, allLines, lineKey, seededShuffleCopy, countForcedDigits, mergeNoProgressStages} = require("./keenDivision.js")
+const {parseKeenDescriptor, buildMaskedDescriptor, touchingCagesByLine, rowColStartCandidates, allLines, seededShuffleCopy, countForcedDigits, mergeNoProgressStages} = require("./keenDivision.js")
 
 document.addEventListener("alpine:init", onInit)
 
@@ -563,115 +563,188 @@ function keenDescriptorForCount(plan, unlockedCount) {
 }
 
 /**
+ * Decide which additional clues to reveal for the next progressive-
+ * reveal stage of a Keen puzzle, given what's visible so far and how
+ * many digits that already forces (prevForced). Always prefers
+ * whichever candidate forces the FEWEST new digits over prevForced
+ * (never just the first one that works), searching in order of
+ * increasing granularity -- lines first, individual cages only as a
+ * fallback:
+ *
+ *   1. Every remaining single line (row or column) that isn't already
+ *      fully visible -- if any forces a new digit, take whichever one
+ *      forces the fewest.
+ *   2. Otherwise, every remaining-row + remaining-column pair (mirrors
+ *      rowColStartCandidates()'s own stage-1 search, restricted to
+ *      lines that aren't already fully visible) -- take whichever
+ *      forces the fewest new digits.
+ *   3. Otherwise, drop from *lines* down to individual *cages*. A line
+ *      always drags along every cage it touches, and some puzzles have
+ *      a cage sprawling across most of the grid (or several cages
+ *      packed into just a few lines), so a line-sized reveal can
+ *      expose far more of the puzzle than was actually needed for even
+ *      one new deduction -- this is what a real reported puzzle hit:
+ *      the first stage's minimal *line* pick still dragged in 14 of 16
+ *      cages. So once no single line or line pair helps at all, search
+ *      for the smallest *cage* subset that does: every remaining
+ *      single cage, then every remaining cage pair, then (if truly
+ *      nothing that small works) add remaining cages one at a time in
+ *      random order until something helps or every cage's been added
+ *      -- which always finishes the puzzle.
+ *
+ * Whichever level above found a qualifying candidate, its cage set is
+ * then locally minimized before being returned: cages are tried for
+ * removal one at a time (from the end backwards), keeping each removal
+ * that still leaves the candidate forcing more than prevForced. This
+ * matters most for the cage-plateau fallback, whose random incremental
+ * order can otherwise land on a wildly non-minimal superset -- for the
+ * real reported puzzle above, the plateau's raw result before this
+ * step was 15 of 16 cages, even though an exhaustive search found a
+ * qualifying 6-cage subset. The shrink pass alone got that puzzle's
+ * first stage down to exactly 6 cages. It's not guaranteed to find the
+ * true global minimum (it only ever removes cages from whatever
+ * candidate a level above already found), but it's cheap -- at most
+ * one solve per cage in the candidate -- and it never leaves in a cage
+ * that turns out not to matter.
+ *
+ * If the currently-visible set already forces the entire grid (nothing
+ * left for any reveal to gain), skips straight to adding one random
+ * remaining line (or, once every line is already fully visible, one
+ * random remaining cage) without probing any candidates --
+ * mergeNoProgressStages() cleans up the resulting no-op stage
+ * afterward regardless of what got picked.
+ *
+ * Returns { cageIds, forced, forcedDigits, level } for the chosen
+ * reveal (cageIds is just the *added* cage ids, not the cumulative
+ * visible set), or null if there is nothing left to reveal at all.
+ */
+async function chooseNextStageReveal(parsed, paramsStr, visible, cagesForLine, prevForced, seedInput) {
+    const w = parsed.w;
+    const lineFullyVisible = (line) => [...cagesForLine(line)].every(id => visible.has(id));
+    const remainingLines = allLines(w).filter(l => !lineFullyVisible(l));
+    const remainingCages = parsed.cageOrder.filter(id => !visible.has(id));
+
+    if (remainingLines.length === 0 && remainingCages.length === 0) return null;
+
+    const evaluateCages = async (cageIds) => {
+        const candidateVisible = new Set(visible);
+        for (const id of cageIds) candidateVisible.add(id);
+        const forcedDigits = await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidateVisible));
+        return { cageIds, forced: countForcedDigits(forcedDigits), forcedDigits };
+    };
+    const evaluateLines = async (lines) => {
+        const cageIds = [];
+        const seen = new Set();
+        for (const line of lines) {
+            for (const id of cagesForLine(line)) {
+                if (!seen.has(id)) { seen.add(id); cageIds.push(id); }
+            }
+        }
+        return await evaluateCages(cageIds);
+    };
+    // Whatever level found a qualifying candidate, its cage set may
+    // still contain cages that weren't actually necessary for the new
+    // deduction (a line/pair drags in every cage it touches, and even
+    // the cage-plateau's random incremental order can overshoot the
+    // true minimal subset by a lot -- a real reported puzzle's minimal
+    // qualifying subset was just 6 cages, but the plateau's random
+    // order didn't stumble onto a small one until 15 of 16 cages were
+    // in). Locally minimize: repeatedly try dropping each cage (from
+    // the end backwards) and keep the drop if the remaining set still
+    // forces more than prevForced. This can't find the smallest
+    // possible subset in general, but it always removes every cage
+    // that turns out not to matter for this particular candidate.
+    const shrinkCandidate = async (candidate) => {
+        let working = candidate.cageIds.slice();
+        for (let i = working.length - 1; i >= 0 && working.length > 1; i--) {
+            const trial = working.slice(0, i).concat(working.slice(i + 1));
+            const outcome = await evaluateCages(trial);
+            if (outcome.forced > prevForced) working = trial;
+        }
+        if (working.length === candidate.cageIds.length) return candidate;
+        return await evaluateCages(working);
+    };
+
+    if (prevForced >= w * w) {
+        if (remainingLines.length > 0) {
+            const line = seededShuffleCopy(remainingLines, `${seedInput}:already-solved`)[0];
+            return { ...(await evaluateLines([line])), level: 'already-solved' };
+        }
+        const cageId = seededShuffleCopy(remainingCages, `${seedInput}:already-solved-cage`)[0];
+        return { ...(await evaluateCages([cageId])), level: 'already-solved' };
+    }
+
+    // Level 1: every remaining single line -- take the smallest reveal.
+    let best = null;
+    for (const line of seededShuffleCopy(remainingLines, `${seedInput}:line`)) {
+        const outcome = await evaluateLines([line]);
+        if (outcome.forced > prevForced && (!best || outcome.forced < best.forced)) best = outcome;
+    }
+    if (best) return { ...(await shrinkCandidate(best)), level: 1 };
+
+    // Level 2: every remaining-row + remaining-column pair.
+    const remainingRows = new Set(remainingLines.filter(l => l.type === 'row').map(l => l.index));
+    const remainingCols = new Set(remainingLines.filter(l => l.type === 'col').map(l => l.index));
+    if (remainingRows.size > 0 && remainingCols.size > 0) {
+        const pairCandidates = rowColStartCandidates(parsed, `${seedInput}:pair`)
+            .filter(c => remainingRows.has(c.row) && remainingCols.has(c.col));
+        for (const cand of pairCandidates) {
+            const outcome = await evaluateLines([{ type: 'row', index: cand.row }, { type: 'col', index: cand.col }]);
+            if (outcome.forced > prevForced && (!best || outcome.forced < best.forced)) best = outcome;
+        }
+    }
+    if (best) return { ...(await shrinkCandidate(best)), level: 2 };
+
+    // Level 3: no line or line-pair helps at all -- fall back to
+    // individual cages, which can never drag in more than what's
+    // actually asked for.
+    if (remainingCages.length === 0) return null;
+
+    for (const cageId of seededShuffleCopy(remainingCages, `${seedInput}:cage`)) {
+        const outcome = await evaluateCages([cageId]);
+        if (outcome.forced > prevForced && (!best || outcome.forced < best.forced)) best = outcome;
+    }
+    if (best) return { ...(await shrinkCandidate(best)), level: '3-cage' };
+
+    for (let i = 0; i < remainingCages.length; i++) {
+        for (let j = i + 1; j < remainingCages.length; j++) {
+            const outcome = await evaluateCages([remainingCages[i], remainingCages[j]]);
+            if (outcome.forced > prevForced && (!best || outcome.forced < best.forced)) best = outcome;
+        }
+    }
+    if (best) return { ...(await shrinkCandidate(best)), level: '3-cage-pair' };
+
+    // Genuine plateau even at cage granularity -- add remaining cages
+    // one at a time, in random order, until something helps or
+    // everything's been added (which reproduces the full descriptor
+    // and therefore always finishes the puzzle).
+    const accumulated = [];
+    let lastOutcome = null;
+    for (const cageId of seededShuffleCopy(remainingCages, `${seedInput}:cage-random`)) {
+        accumulated.push(cageId);
+        lastOutcome = await evaluateCages(accumulated.slice());
+        if (lastOutcome.forced > prevForced) return { ...(await shrinkCandidate(lastOutcome)), level: '3-cage-plateau' };
+    }
+    return { ...(await shrinkCandidate(lastOutcome)), level: '3-cage-plateau-full' };
+}
+
+/**
  * Parse a just-resolved full game id (as reported by js_update_permalinks,
  * "<params>:<descriptor>") and cache this puzzle's clue-group division
  * plan on the entry, so future loads/reveals for this puzzle instance
  * never need another hidden WASM resolution pass -- everything from here
  * on is pure-JS re-masking of the same parsed structure.
  *
- * Every stage is a whole number of rows/columns, not arbitrary cage
- * chunks: stage 1 is one row plus one column (via
- * rowColStartCandidates()), and every later stage adds exactly one more
- * row or column -- whichever (searched over every not-yet-used line, in
- * seeded-shuffled order) actually forces a new digit according to the
- * real, unmodified solver (getForcedDigits()/solve_partial_desc(), via
- * the same hidden puzzleframe this resolution pass already has loaded).
- * If no single remaining line adds anything, the search escalates to
- * pairs of remaining lines (rows and/or columns together); if even that
- * fails, or the world's digit_group_count has been reached, the stage
- * takes every remaining line at once, which always finishes the puzzle
- * (a hidden cage's every cell has an unused row and an unused column by
- * definition, so revealing every remaining line always reveals every
- * remaining cage -- this is also what guarantees a player holding every
- * Clue Set item for a puzzle always sees the complete thing, not a
- * partially-clued dead end). mergeNoProgressStages() is still run as a
- * final defensive pass, though by construction every stage here should
- * already strictly increase its forced-digit count over the last.
+ * Each stage's reveal is chosen by chooseNextStageReveal() above (lines
+ * first, falling back to individual cages), except the very last stage
+ * the world's digit_group_count allows, which always takes every still-
+ * hidden cage at once regardless of what a smaller reveal would do --
+ * this is what guarantees a player holding every Clue Set item for a
+ * puzzle always sees the complete thing, not a partially-clued dead
+ * end. mergeNoProgressStages() is still run as a final defensive pass,
+ * though by construction every non-final stage here should already
+ * strictly increase its forced-digit count over the last.
  */
-/**
- * Chooses the next digit group's line(s) to reveal, given the cages
- * already visible and the lines already used by earlier stages. Always
- * prefers the option that reveals the FEWEST new digits over the
- * previous stage's forced count (not just the first option that helps),
- * so each digit group is as fine-grained as the puzzle's structure
- * allows, searching from smallest reveal to largest:
- *
- *   1. Every remaining single row or column (up to 2w options) -- if any
- *      forces a new digit, take whichever one forces the fewest.
- *   2. Otherwise, every remaining-row + remaining-column pair (up to w^2
- *      options -- same shape as rowColStartCandidates's own stage-1
- *      search, just restricted to lines no earlier stage has used yet)
- *      -- take whichever one forces the fewest new digits.
- *   3. Otherwise (a genuine plateau: no single line or pair helps at
- *      all), add remaining lines one at a time in random order until
- *      either a new digit becomes forced or every remaining line has
- *      been added -- which always finishes the puzzle, since a hidden
- *      cage always sits in an unrevealed row *and* an unrevealed column,
- *      so adding every remaining line always reveals every remaining
- *      cage.
- *
- * If the currently-visible set already forces the entire grid (nothing
- * left for any reveal to gain), skips straight to adding one random
- * remaining line without probing any candidates -- there's nothing a
- * search could find, and mergeNoProgressStages() cleans up the resulting
- * no-op stage afterward regardless of which line got picked.
- *
- * Returns { lines, forced, forcedDigits } for the chosen reveal, or null
- * if there are no remaining lines left to add at all (every line already
- * used by an earlier stage).
- */
-async function chooseNextStageLines(parsed, paramsStr, visible, usedLines, cagesForLine, prevForced, seedInput) {
-    const w = parsed.w;
-    const remaining = allLines(w).filter(l => !usedLines.has(lineKey(l)));
-    if (remaining.length === 0) return null;
-
-    const evaluate = async (lines) => {
-        const candidateVisible = new Set(visible);
-        for (const line of lines) for (const id of cagesForLine(line)) candidateVisible.add(id);
-        const forcedDigits = await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidateVisible));
-        return { lines, forced: countForcedDigits(forcedDigits), forcedDigits };
-    };
-
-    if (prevForced >= w * w) {
-        const line = seededShuffleCopy(remaining, `${seedInput}:already-solved`)[0];
-        return await evaluate([line]);
-    }
-
-    // Level 1: every remaining single line -- take the smallest reveal.
-    let best = null;
-    for (const line of seededShuffleCopy(remaining, `${seedInput}:line`)) {
-        const outcome = await evaluate([line]);
-        if (outcome.forced > prevForced && (!best || outcome.forced < best.forced)) best = outcome;
-    }
-    if (best) return best;
-
-    // Level 2: every remaining-row + remaining-column pair -- same idea,
-    // restricted to lines that haven't been used yet.
-    const remainingRows = new Set(remaining.filter(l => l.type === 'row').map(l => l.index));
-    const remainingCols = new Set(remaining.filter(l => l.type === 'col').map(l => l.index));
-    if (remainingRows.size > 0 && remainingCols.size > 0) {
-        const pairCandidates = rowColStartCandidates(parsed, `${seedInput}:pair`)
-            .filter(c => remainingRows.has(c.row) && remainingCols.has(c.col));
-        for (const cand of pairCandidates) {
-            const outcome = await evaluate([{ type: 'row', index: cand.row }, { type: 'col', index: cand.col }]);
-            if (outcome.forced > prevForced && (!best || outcome.forced < best.forced)) best = outcome;
-        }
-    }
-    if (best) return best;
-
-    // Level 3: a genuine plateau -- add remaining lines one at a time,
-    // in random order, until something helps or everything's been added
-    // (which reproduces the full/unmasked descriptor and therefore
-    // always finishes the puzzle).
-    const accumulated = [];
-    let lastOutcome = null;
-    for (const line of seededShuffleCopy(remaining, `${seedInput}:random`)) {
-        accumulated.push(line);
-        lastOutcome = await evaluate(accumulated.slice());
-        if (lastOutcome.forced > prevForced) return lastOutcome;
-    }
-    return lastOutcome;
-}
 
 async function resolveKeenStagePlan(entry, gameId) {
     const colonIndex = gameId.indexOf(':');
@@ -706,50 +779,40 @@ async function resolveKeenStagePlan(entry, gameId) {
     const cagesForLine = (line) => (line.type === 'row' ? touchingByRow[line.index] : touchingByCol[line.index]);
 
     const visible = new Set();
-    const usedLines = new Set();
     const stages = [];
     const forcedCounts = [];
-
-    const applyLines = (lines) => {
-        for (const line of lines) {
-            usedLines.add(lineKey(line));
-            for (const id of cagesForLine(line)) visible.add(id);
-        }
-    };
 
     while (stages.length < targetGroups) {
         const prevForced = forcedCounts.length > 0 ? forcedCounts[forcedCounts.length - 1] : 0;
         const isFinalAllowedStage = stages.length === targetGroups - 1;
 
-        let chosenLines, chosenForced, chosenForcedDigits;
+        let chosenCageIds, chosenForced, chosenForcedDigits;
 
         if (isFinalAllowedStage) {
             // The last stage the world's digit_group_count allows must be
             // the complete puzzle regardless of what a smaller reveal
-            // would do -- a hidden cage always sits in an unrevealed row
-            // *and* an unrevealed column, so taking every remaining line
-            // at once always reveals every remaining cage, guaranteeing a
-            // player holding every Clue Set item for this puzzle always
-            // sees the complete thing (see the doc comment on the search
-            // levels below for why this can't be left to the general
-            // search).
-            const remaining = allLines(w).filter(l => !usedLines.has(lineKey(l)));
-            if (remaining.length === 0) break;
-            chosenLines = remaining;
+            // would do -- take every still-hidden cage at once,
+            // guaranteeing a player holding every Clue Set item for this
+            // puzzle always sees the complete thing (see the doc comment
+            // on chooseNextStageReveal() above for why this can't be
+            // left to the general search).
+            const remainingCageIds = allCageIds.filter(id => !visible.has(id));
+            if (remainingCageIds.length === 0) break;
+            chosenCageIds = remainingCageIds;
             const candidateVisible = new Set(visible);
-            for (const line of chosenLines) for (const id of cagesForLine(line)) candidateVisible.add(id);
+            for (const id of chosenCageIds) candidateVisible.add(id);
             chosenForcedDigits = await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidateVisible));
             chosenForced = countForcedDigits(chosenForcedDigits);
         } else {
-            const outcome = await chooseNextStageLines(
-                parsed, paramsStr, visible, usedLines, cagesForLine, prevForced, `${gameId}:${stages.length}`);
+            const outcome = await chooseNextStageReveal(
+                parsed, paramsStr, visible, cagesForLine, prevForced, `${gameId}:${stages.length}`);
             if (!outcome) break;
-            chosenLines = outcome.lines;
+            chosenCageIds = outcome.cageIds;
             chosenForced = outcome.forced;
             chosenForcedDigits = outcome.forcedDigits;
         }
 
-        applyLines(chosenLines);
+        for (const id of chosenCageIds) visible.add(id);
         stages.push({ cageIds: new Set(visible), descriptor: buildMaskedDescriptor(parsed, visible), forcedDigits: chosenForcedDigits });
         forcedCounts.push(chosenForced);
     }
@@ -779,19 +842,29 @@ function keenVisibleId(entry) {
 /**
  * Push any newly-unlocked clues for `entry` into its puzzle frame *in
  * place*, if (and only if) `entry` is the puzzle currently open and
- * new clues have actually arrived since it was last loaded/reveal
- * -- called from syncAPStatus() (see onReceiveItems()) so an
- * already-open puzzle updates live the moment a new "Clue Set" item
- * comes in, instead of requiring the player to back out to the list
- * and reselect the puzzle to see it (the previous behavior).
+ * new clues have actually arrived since it was last loaded/reveal.
+ * Two callers:
+ *   - syncAPStatus() (see onReceiveItems()), so an already-open puzzle
+ *     updates live the moment a new "Clue Set" item comes in, instead
+ *     of requiring the player to back out to the list and reselect
+ *     the puzzle to see it (the previous behavior).
+ *   - loadPuzzleData(), right after restoring a manual "Save puzzle
+ *     progress" save, to catch up a puzzle that was saved (and thus
+ *     had fewer clues visible) before more Clue Set items were
+ *     unlocked for it elsewhere -- otherwise the just-restored midend
+ *     would be stuck showing only whatever was visible at save time
+ *     forever, since loadPuzzle() deliberately never sends a fresh
+ *     visible id once it sees a save exists (see loadPuzzle()'s
+ *     "Don't bother sending ID if save data exists").
  *
  * Deliberately does NOT go through loadPuzzle()/keenVisibleId() --
- * that reloads the whole iframe, which (since there's no autosave of
- * in-progress digit entries in multiworld mode) would throw away
- * whatever the player has typed in since opening the puzzle. Instead
- * this calls the native reveal_clues() hook (see keen.c/puzzles.h),
- * which updates the live midend's own clue data directly and redraws,
- * leaving the player's entered grid untouched.
+ * that reloads the whole iframe, which (since there's no *automatic*
+ * saving of in-progress digit entries as the player types -- only the
+ * explicit "Save puzzle progress" button, or a full solve) would throw
+ * away whatever the player has typed since their last manual save.
+ * Instead this calls the native reveal_clues() hook (see
+ * keen.c/puzzles.h), which updates the live midend's own clue data
+ * directly and redraws, leaving the player's entered grid untouched.
  */
 async function liveRevealClues(entry) {
     const plan = entry.stagePlan;
@@ -834,7 +907,25 @@ function loadKeenAwarePuzzleEntry(entry) {
 
     resolvingKeenEntry = entry;
     suppressNextReveal = true;
-    loadPuzzle(entry.genre, entry.puzzleId || entry.puzzleSeed, true, entry.index);
+    // Deliberately pass no saveKey here (unlike every other
+    // loadPuzzle() call in this function): loadPuzzle() skips sending
+    // its id whenever it sees a save exists for the given saveKey,
+    // trusting that js_post_init()'s loadPuzzleData() will restore the
+    // real state right after -- but suppressNextReveal makes
+    // js_post_init() return early and skip loadPuzzleData()
+    // entirely for this hidden pass. Without this, a puzzle that was
+    // saved in an earlier session (so entry.stagePlan hasn't been
+    // computed yet *this* session) would have its id silently dropped
+    // here, and the hidden pass would resolve a clue-group plan
+    // against whatever unrelated random puzzle the WASM module
+    // defaults to with no id at all -- permanently corrupting
+    // entry.stagePlan for this puzzle for the rest of the session
+    // (every later reveal would then be checked against the wrong
+    // block structure and rejected). The real save still gets
+    // restored correctly by the second, non-hidden loadPuzzle() call
+    // below once resolution finishes (see the resolvingKeenEntry
+    // branch in js_update_permalinks), which does pass entry.index.
+    loadPuzzle(entry.genre, entry.puzzleId || entry.puzzleSeed, true, null);
 }
 
 async function loadPuzzle(genre, id, singleMode, saveKey) {
@@ -1143,7 +1234,7 @@ const messageHandlers = {
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
     savePuzzleDataCallback, getForcedDigitsCallback, getCurrentGridCallback,
-    revealCluesCallback
+    revealCluesCallback, loadPuzzleDataCallback
 }
 
 function processMessage(message) {
@@ -1394,15 +1485,54 @@ function setNewGameEnabled(allowNewGame) {
     sendMessage("setNewGameEnabled", allowNewGame)
 }
 
+// Resolved once the iframe confirms a just-sent "loadPuzzleData" save
+// has actually finished restoring (see loadPuzzleDataCallback below) --
+// needed so loadPuzzleData() can reliably run its post-restore clue
+// catch-up only after the restored game state is actually live, not
+// merely dispatched.
+let pendingLoadPuzzleDataResolve = null;
+
+function loadPuzzleDataCallback() {
+    if (pendingLoadPuzzleDataResolve) {
+        let resolve = pendingLoadPuzzleDataResolve;
+        pendingLoadPuzzleDataResolve = null;
+        resolve();
+    }
+}
+
 async function loadPuzzleData() {
     const gamesaves = Alpine.store("gamesaves");
     const puzzleList = Alpine.store("puzzleList");
     if (!gamesaves.current || !puzzleList.current) return;
 
-    let data = await gamesaves.current.getPuzzleSave(puzzleList.current.index);
+    const entry = puzzleList.current;
+    let data = await gamesaves.current.getPuzzleSave(entry.index);
 
     if (data) {
-        sendMessage("loadPuzzleData", data);
+        await new Promise((resolve) => {
+            pendingLoadPuzzleDataResolve = resolve;
+            sendMessage("loadPuzzleData", data);
+        });
+
+        // Bug: a save captures whatever clues were visible *at save
+        // time*. If the player since unlocked more "Clue Set" items
+        // for this puzzle elsewhere and comes back, loadPuzzle() (see
+        // loadKeenAwarePuzzleEntry) deliberately skips sending the
+        // freshly-computed visible id whenever a save exists, so the
+        // live midend we just restored only knows about the older,
+        // smaller clue set baked into the save -- new clues never
+        // appear. That earlier keenVisibleId() call already
+        // optimistically set entry.displayedClueCount to the current
+        // unlocked count on the (false, in this case) assumption its
+        // id would actually be what got loaded; clear that back to 0
+        // so liveRevealClues() below does a real check against what's
+        // actually on screen now, and reveals whatever the save was
+        // missing in place (harmless no-op if the save was already
+        // fully caught up).
+        if (entry.stagePlan) {
+            entry.displayedClueCount = 0;
+            await liveRevealClues(entry);
+        }
     }
 }
 
