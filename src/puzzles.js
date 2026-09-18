@@ -107,12 +107,15 @@ class ArchipelagoPuzzle {
         this.solved = true;
         this.updateState();
 
-        // TODO should probably extract this somewhere
-        if (isApReady()) {
-            let locationId = locationNameToId(`Puzzle ${this.index} Reward`);
-
-            client.check(locationId);
-        }
+        // Sending the actual Archipelago location checks for this puzzle
+        // happens in checkDigitGroupProgress() (see js_update_status()),
+        // driven by comparing the player's live entered digits against
+        // each Digit Group's own solver-forced cells -- not here. This
+        // used to call client.check() on a "Puzzle N Reward" location,
+        // but no such location exists in sgtkeen's location table (every
+        // location is "Puzzle {i} Digit Group {j}"), so that call was
+        // always checking client.check(undefined) and never sent
+        // anything.
     }
 
     static fromArchipelagoString(genreAndParams, baseSeed, index, options) {
@@ -883,6 +886,19 @@ function js_update_status(newStatus) {
         puzzleState.solved = true
         Alpine.store("puzzleList").markSolved()
     }
+
+    // Called after every move (including undo/redo, and once right after
+    // initial load -- see post_move() in emcc-ap.c), so this is the right
+    // hook for sending Digit Group checks the moment the player's live
+    // entries actually satisfy them, rather than waiting on the engine's
+    // own "fully solved, no errors" signal above (which only fires for a
+    // complete, unmasked solve and can't tell individual digit groups
+    // apart). Guarded by suppressNextReveal so it never fires during the
+    // hidden, throwaway resolution pass used to compute a Keen puzzle's
+    // stage plan.
+    if (!suppressNextReveal) {
+        checkDigitGroupProgress(Alpine.store("puzzleList").current);
+    }
 }
 
 function js_update_key_labels(pcl, scl) {
@@ -992,13 +1008,34 @@ function getForcedDigits(paramsStr, desc) {
     });
 }
 
+// Same one-request-at-a-time pattern as getForcedDigits() above, for
+// reading the live, currently-displayed puzzle's actual entered digits
+// (see getCurrentGrid() in static/puzzleframe.js). Used by
+// checkDigitGroupProgress() below.
+let pendingCurrentGridResolve = null;
+
+function getCurrentGridCallback(result) {
+    if (pendingCurrentGridResolve) {
+        let resolve = pendingCurrentGridResolve;
+        pendingCurrentGridResolve = null;
+        resolve(result);
+    }
+}
+
+function getCurrentGrid() {
+    return new Promise((resolve) => {
+        pendingCurrentGridResolve = resolve;
+        sendMessage("getCurrentGrid");
+    });
+}
+
 const messageHandlers = {
     ready: onPuzzleFrameLoad, js_init_puzzle, js_post_init,
     js_update_permalinks, js_enable_undo_redo, js_remove_solve_button, js_update_status, js_update_key_labels,
     js_add_preset, js_add_preset_submenu, js_select_preset,
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
-    savePuzzleDataCallback, getForcedDigitsCallback
+    savePuzzleDataCallback, getForcedDigitsCallback, getCurrentGridCallback
 }
 
 function processMessage(message) {
@@ -1073,6 +1110,33 @@ function solvePuzzle() {
  * hidden-resolution-pass) doesn't have one either, and a puzzle whose
  * every digit group is already unlocked has no "next" group to show.
  */
+/**
+ * The cell indices belonging to Digit Group `groupNumber` (1-indexed)
+ * alone -- i.e. newly deducible there compared to the group before it
+ * (or an all-undetermined baseline, for group 1) -- using each stage's
+ * real solver-forced digit string, precomputed and cached by
+ * resolveKeenStagePlan(). This is the one place that decides what a
+ * "digit group" actually consists of; both the "highlight next group"
+ * UI feature and the Archipelago completion check below build on it,
+ * so they can never disagree about it. Returns [] for an out-of-range
+ * groupNumber (0, or beyond how many stages this puzzle achieved).
+ */
+function digitGroupCells(plan, groupNumber) {
+    const stageIndex = groupNumber - 1;
+    if (stageIndex < 0 || stageIndex >= plan.stages.length) return [];
+
+    const previousForced = stageIndex > 0
+        ? plan.stages[stageIndex - 1].forcedDigits
+        : "0".repeat(plan.w * plan.w);
+    const targetForced = plan.stages[stageIndex].forcedDigits;
+
+    const cells = [];
+    for (let i = 0; i < targetForced.length; i++) {
+        if (targetForced[i] !== "0" && previousForced[i] === "0") cells.push(i);
+    }
+    return cells;
+}
+
 function toggleNextGroupHighlight() {
     const puzzleState = Alpine.store("puzzleState");
 
@@ -1087,30 +1151,93 @@ function toggleNextGroupHighlight() {
     if (!plan) return;
 
     const unlockedCount = isApReady() ? countReceivedClueSets(entry.index) : 0;
-    if (unlockedCount >= plan.stages.length) return;
 
-    // "Next digit group" means newly *deducible* cells, not just cells
-    // belonging to newly-visible cages: a new clue's constraint can pin
-    // down a cell in an already-visible cage (propagation), and a newly
-    // visible cage's own cells aren't necessarily solvable yet either.
-    // Each stage's real solver-forced digit string is precomputed and
-    // cached by resolveKeenStagePlan(); diff the next stage's against the
-    // currently-unlocked one's (or an all-undetermined baseline, if the
-    // player has no items for this puzzle yet) to get exactly the cells
-    // that become newly solvable -- i.e. what the player could fill in
-    // for their next Clue Set item.
-    const previousForced = unlockedCount > 0
-        ? plan.stages[unlockedCount - 1].forcedDigits
-        : "0".repeat(plan.w * plan.w);
-    const nextForced = plan.stages[unlockedCount].forcedDigits;
-
-    const cells = [];
-    for (let i = 0; i < nextForced.length; i++) {
-        if (nextForced[i] !== "0" && previousForced[i] === "0") cells.push(i);
-    }
+    // "The next digit group" is the one the player has *just* unlocked
+    // enough items to see and needs to complete now -- Digit Group
+    // `unlockedCount` (1-indexed, per rules.py's `count(Clue Set) >= j`
+    // access rule) -- not some future group requiring items they don't
+    // have yet. With zero items, there's nothing deducible at all (an
+    // already-established invariant -- see Stage 1), so the highlight is
+    // correctly empty rather than an error.
+    const targetGroupNumber = Math.min(unlockedCount, plan.stages.length);
+    const cells = targetGroupNumber > 0 ? digitGroupCells(plan, targetGroupNumber) : [];
 
     puzzleState.highlightingNextGroup = true;
     sendMessage("setDigitGroupHighlight", cells, plan.w);
+}
+
+/**
+ * Stage 4: send the Archipelago location check for a digit group as
+ * soon as the player has actually, correctly filled in its cells --
+ * not when the engine's own "solved" callback fires (js_update_status),
+ * which can't be trusted here: a masked puzzle with fewer than the full
+ * clue set can have multiple grids that satisfy just the *visible*
+ * clues, so "no errors and every cell full" doesn't mean "matches this
+ * digit group's actually-forced answer". Instead this compares the
+ * player's live entered digits (getCurrentGrid(), read straight off the
+ * midend, no solving) against each not-yet-checked group's own forced
+ * cells (digitGroupCells() above, backed by the real solve_partial
+ * solver) cell by cell.
+ *
+ * Called after every move (see js_update_status()) for whichever entry
+ * is currently loaded, so it naturally also catches a save that was
+ * already correctly filled in before this feature existed the moment
+ * it's reopened (post_move() fires once right after the initial load
+ * too, not just after player input).
+ */
+async function checkDigitGroupProgress(entry) {
+    if (!isApReady()) return;
+    const plan = entry && entry.stagePlan;
+    if (!plan) return;
+
+    const unlockedCount = countReceivedClueSets(entry.index);
+    if (unlockedCount <= 0) return;
+
+    const currentGrid = await getCurrentGrid();
+    if (!currentGrid) return;
+
+    // Digit Groups 1..unlockedCount are each individually checkable now
+    // (rules.py's access rule), whether or not this client's own
+    // line-search happened to land exactly that many *distinct* stages
+    // -- targetCount clamps to however many this puzzle actually
+    // achieved, same as the highlight above.
+    const targetCount = Math.min(unlockedCount, plan.stages.length);
+    for (let groupNumber = 1; groupNumber <= targetCount; groupNumber++) {
+        const cells = digitGroupCells(plan, groupNumber);
+        if (cells.length === 0) continue;
+        if (!cells.every(i => currentGrid[i] === plan.stages[groupNumber - 1].forcedDigits[i])) continue;
+
+        const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${groupNumber}`);
+        if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
+            client.check(locationId);
+        }
+    }
+
+    // K < N: this client's search only ever achieves `plan.stages.length`
+    // distinct stages, which can be less than the world's configured
+    // digitGroupCount when no single line or pair of lines makes
+    // progress for long stretches (see Refinement 3's documented
+    // trade-off) -- the *final* achieved stage is always the complete
+    // puzzle regardless, so once it's correctly and fully filled in,
+    // also send every Digit Group location beyond what this client
+    // could present as its own separate stage, so none of them are
+    // permanently unreachable just because the search couldn't find
+    // that many genuine reveals.
+    if (targetCount === plan.stages.length) {
+        const finalForced = plan.stages[plan.stages.length - 1].forcedDigits;
+        const fullySolved = currentGrid.length === finalForced.length
+            && [...finalForced].every((d, i) => currentGrid[i] === d);
+
+        if (fullySolved) {
+            const totalGroups = Math.max(plan.stages.length, entry.digitGroupCount || plan.stages.length);
+            for (let groupNumber = plan.stages.length + 1; groupNumber <= totalGroups; groupNumber++) {
+                const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${groupNumber}`);
+                if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
+                    client.check(locationId);
+                }
+            }
+        }
+    }
 }
 
 function setPreset(id) {
@@ -1195,9 +1322,20 @@ function syncAPStatus() {
     for (let entry of puzzleList.entries) {
         let dirty = false;
         let itemId = itemNameToId(`Puzzle ${entry.index}`);
-        let locationId = locationNameToId(`Puzzle ${entry.index} Reward`);
 
-        if (!entry.collected && client.room.checkedLocations.includes(locationId)) {
+        // "Collected" means every Digit Group location for this puzzle has
+        // been checked -- there's no separate "Reward" location in
+        // sgtkeen's location table (every location is
+        // "Puzzle {i} Digit Group {j}"), and checkDigitGroupProgress()'s
+        // own K<N handling guarantees that once a puzzle is fully and
+        // correctly solved, every group up through digitGroupCount gets
+        // checked, not just however many distinct stages this client's
+        // search happened to produce -- so the *last* group number is a
+        // reliable "is this puzzle entirely done" signal.
+        let finalGroupNumber = entry.digitGroupCount || 1;
+        let locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${finalGroupNumber}`);
+
+        if (!entry.collected && locationId !== undefined && client.room.checkedLocations.includes(locationId)) {
             entry.collected = true;
             dirty = true;
         } else if (!entry.collected) {

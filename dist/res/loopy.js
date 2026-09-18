@@ -257,6 +257,7 @@ var load_game
 // true top-level vars too, assigned (without `var`) inside
 // initPuzzle() below.
 var solve_partial_desc, free_solve_partial
+var get_current_grid, free_current_grid
 
 // The <form> encapsulating the menus.  Used by
 // js_get_selected_preset() and js_select_preset().
@@ -634,6 +635,10 @@ function initPuzzle() {
                                        ['string', 'string']);
     free_solve_partial = Module.cwrap('free_solve_partial', 'void',
                                        ['number']);
+
+    get_current_grid = Module.cwrap('get_current_grid', 'number', []);
+    free_current_grid = Module.cwrap('free_current_grid', 'void',
+                                      ['number']);
 
     if (save_button) save_button.onclick = function(event) {
         if (dlg_dimmer === null) {
@@ -3272,6 +3277,8 @@ var _get_text_format = Module['_get_text_format'] = makeInvalidEarlyAccess('_get
 var _free_text_format = Module['_free_text_format'] = makeInvalidEarlyAccess('_free_text_format');
 var _solve_partial_desc = Module['_solve_partial_desc'] = makeInvalidEarlyAccess('_solve_partial_desc');
 var _free_solve_partial = Module['_free_solve_partial'] = makeInvalidEarlyAccess('_free_solve_partial');
+var _get_current_grid = Module['_get_current_grid'] = makeInvalidEarlyAccess('_get_current_grid');
+var _free_current_grid = Module['_free_current_grid'] = makeInvalidEarlyAccess('_free_current_grid');
 var _get_save_file = Module['_get_save_file'] = makeInvalidEarlyAccess('_get_save_file');
 var _free_save_file = Module['_free_save_file'] = makeInvalidEarlyAccess('_free_save_file');
 var _load_game = Module['_load_game'] = makeInvalidEarlyAccess('_load_game');
@@ -3309,6 +3316,8 @@ function assignWasmExports(wasmExports) {
   assert(typeof wasmExports['free_text_format'] != 'undefined', 'missing Wasm export: free_text_format');
   assert(typeof wasmExports['solve_partial_desc'] != 'undefined', 'missing Wasm export: solve_partial_desc');
   assert(typeof wasmExports['free_solve_partial'] != 'undefined', 'missing Wasm export: free_solve_partial');
+  assert(typeof wasmExports['get_current_grid'] != 'undefined', 'missing Wasm export: get_current_grid');
+  assert(typeof wasmExports['free_current_grid'] != 'undefined', 'missing Wasm export: free_current_grid');
   assert(typeof wasmExports['get_save_file'] != 'undefined', 'missing Wasm export: get_save_file');
   assert(typeof wasmExports['free_save_file'] != 'undefined', 'missing Wasm export: free_save_file');
   assert(typeof wasmExports['load_game'] != 'undefined', 'missing Wasm export: load_game');
@@ -3343,6 +3352,8 @@ function assignWasmExports(wasmExports) {
   _free_text_format = Module['_free_text_format'] = createExportWrapper('free_text_format', wasmExports['free_text_format'], 1);
   _solve_partial_desc = Module['_solve_partial_desc'] = createExportWrapper('solve_partial_desc', wasmExports['solve_partial_desc'], 2);
   _free_solve_partial = Module['_free_solve_partial'] = createExportWrapper('free_solve_partial', wasmExports['free_solve_partial'], 1);
+  _get_current_grid = Module['_get_current_grid'] = createExportWrapper('get_current_grid', wasmExports['get_current_grid'], 0);
+  _free_current_grid = Module['_free_current_grid'] = createExportWrapper('free_current_grid', wasmExports['free_current_grid'], 1);
   _get_save_file = Module['_get_save_file'] = createExportWrapper('get_save_file', wasmExports['get_save_file'], 0);
   _free_save_file = Module['_free_save_file'] = createExportWrapper('free_save_file', wasmExports['free_save_file'], 1);
   _load_game = Module['_load_game'] = createExportWrapper('load_game', wasmExports['load_game'], 0);

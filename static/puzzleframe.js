@@ -136,6 +136,28 @@ function getForcedDigits(paramsStr, desc) {
     sendMessage("getForcedDigitsCallback", result);
 }
 
+// Read the currently-displayed puzzle's actual entered digits (not its
+// solution) as a digit string, same '0'..'9' convention as
+// getForcedDigits()/solve_partial. Unlike getForcedDigits(), this DOES
+// depend on whatever's currently loaded and live in this iframe's
+// midend -- it's not a pure function of anything passed in. Used by
+// checkDigitGroupProgress() in src/puzzles.js to detect when a digit
+// group's cells have all been correctly filled in, so it can send that
+// group's Archipelago location check.
+function getCurrentGrid() {
+    if (typeof get_current_grid !== "function") {
+        // Current genre doesn't implement current_grid (e.g. not Keen).
+        sendMessage("getCurrentGridCallback", null);
+        return;
+    }
+
+    var ptr = get_current_grid(); // defined in {genre}.js
+    var result = ptr ? UTF8ToString(ptr) : null;
+    if (ptr) free_current_grid(ptr);
+
+    sendMessage("getCurrentGridCallback", result);
+}
+
 // Show or clear the "highlight next digit group" overlay (see
 // toggleNextGroupHighlight() in src/puzzles.js, which computes which
 // cells to highlight -- this function only knows how to draw them).
@@ -177,7 +199,7 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData,
-    getForcedDigits, setDigitGroupHighlight
+    getForcedDigits, setDigitGroupHighlight, getCurrentGrid
 }
 
 function processMessage(message) {
