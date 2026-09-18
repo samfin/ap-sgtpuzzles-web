@@ -158,6 +158,26 @@ function getCurrentGrid() {
     sendMessage("getCurrentGridCallback", result);
 }
 
+// Push newly-unlocked clues into the live, currently-loaded puzzle in
+// place, without reloading the frame -- see reveal_clues()'s doc
+// comment (emcc-ap.c/puzzles.h/keen.c) for the full contract. `desc`
+// is a full "block structure,clues" descriptor for the SAME puzzle
+// already loaded; only some cages' clues may newly be un-masked
+// relative to what's already showing. Used by liveRevealClues() in
+// src/puzzles.js so an already-open puzzle updates immediately on
+// receiving a new Archipelago item, rather than requiring the player
+// to back out and reselect it.
+function revealClues(desc) {
+    if (typeof reveal_clues !== "function") {
+        // Current genre doesn't implement reveal_clues (e.g. not Keen).
+        sendMessage("revealCluesCallback", "Not supported for this game");
+        return;
+    }
+
+    var err = reveal_clues(desc); // defined in {genre}.js; a 'string' cwrap, no pointer to free
+    sendMessage("revealCluesCallback", err || null);
+}
+
 // Show or clear the "highlight next digit group" overlay (see
 // toggleNextGroupHighlight() in src/puzzles.js, which computes which
 // cells to highlight -- this function only knows how to draw them).
@@ -199,7 +219,7 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData,
-    getForcedDigits, setDigitGroupHighlight, getCurrentGrid
+    getForcedDigits, setDigitGroupHighlight, getCurrentGrid, revealClues
 }
 
 function processMessage(message) {
