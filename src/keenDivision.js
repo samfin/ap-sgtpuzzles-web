@@ -271,6 +271,110 @@ function divideCages(parsed, targetGroups, seedInput) {
     return { groups, achieved, requested: n };
 }
 
+/**
+ * Every (row, col) combination's starting-group candidate: the union of
+ * cages touching that row or that column, one full row plus one full
+ * column of "coverage" -- in practice almost always enough for the real
+ * solver to deduce at least one digit, unlike a single row or column
+ * alone (see divideCages()'s group[0], which this supersedes as the
+ * starting-group strategy for the progressive-reveal client -- kept
+ * side-by-side rather than replacing divideCages() itself, since that
+ * function's existing callers/tests don't need solver access).
+ *
+ * Returns candidates in a seeded-shuffled order (deterministic per
+ * puzzle instance via seedInput, same scheme as divideCages()), so a
+ * caller can try them in order against the real solver and stop at the
+ * first one that actually forces something. Different (row, col) pairs
+ * can happen to touch the exact same set of cages (small grids
+ * especially); those duplicates are collapsed so a caller never re-tests
+ * an identical mask twice, without skipping any distinct combination's
+ * actual effect.
+ *
+ * Returns [{ row, col, cageIds: number[] }, ...], length <= w*w.
+ */
+function rowColStartCandidates(parsed, seedInput) {
+    const { w } = parsed;
+    const { rows, cols } = touchingCagesByLine(parsed);
+    const rng = mulberry32(hashStringToSeed(String(seedInput)));
+
+    const pairs = [];
+    for (let r = 0; r < w; r++) {
+        for (let c = 0; c < w; c++) {
+            pairs.push([r, c]);
+        }
+    }
+    shuffleInPlace(pairs, rng);
+
+    const seen = new Set();
+    const candidates = [];
+    for (const [r, c] of pairs) {
+        const union = new Set([...rows[r], ...cols[c]]);
+        const cageIds = [...union].sort((a, b) => a - b);
+        const key = cageIds.join(',');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        candidates.push({ row: r, col: c, cageIds });
+    }
+    return candidates;
+}
+
+/**
+ * All 2w "lines" of a w*w grid, as { type: 'row'|'col', index }. Used by
+ * the per-stage line search in src/puzzles.js's resolveKeenStagePlan()
+ * (see also rowColStartCandidates() above, for the very first stage).
+ */
+function allLines(w) {
+    const lines = [];
+    for (let i = 0; i < w; i++) lines.push({ type: 'row', index: i });
+    for (let i = 0; i < w; i++) lines.push({ type: 'col', index: i });
+    return lines;
+}
+
+/**
+ * Stable string key for a line, for Set membership (tracking which lines
+ * have already been revealed).
+ */
+function lineKey(line) {
+    return `${line.type}:${line.index}`;
+}
+
+/**
+ * All k-element combinations of `items` (order-independent, no repeats),
+ * as an array of arrays. Used to escalate the per-stage line search from
+ * a single new row/column to a pair of them when no single remaining
+ * line adds a deducible digit on its own.
+ */
+function combinations(items, k) {
+    const result = [];
+    const combo = [];
+    function recurse(start) {
+        if (combo.length === k) {
+            result.push(combo.slice());
+            return;
+        }
+        for (let i = start; i < items.length; i++) {
+            combo.push(items[i]);
+            recurse(i + 1);
+            combo.pop();
+        }
+    }
+    recurse(0);
+    return result;
+}
+
+/**
+ * A seeded-shuffled copy of `array` (the module's own mulberry32 PRNG,
+ * keyed the same way as divideCages()/rowColStartCandidates()), without
+ * mutating the input. Exposed so callers outside this module (the
+ * per-stage line search in src/puzzles.js) get the same
+ * deterministic-per-puzzle-instance shuffling without duplicating the
+ * seed/PRNG machinery.
+ */
+function seededShuffleCopy(array, seedInput) {
+    const rng = mulberry32(hashStringToSeed(String(seedInput)));
+    return shuffleInPlace(array.slice(), rng);
+}
+
 function buildStageDescriptors(parsed, targetGroups, seedInput) {
     const { groups, achieved, requested } = divideCages(parsed, targetGroups, seedInput);
     const running = new Set();
@@ -284,12 +388,78 @@ function buildStageDescriptors(parsed, targetGroups, seedInput) {
     return { achieved, requested, stages };
 }
 
+/**
+ * Number of forced (non-'0') digits in a forced-digit string as returned
+ * by the game's solve_partial (see getForcedDigits()/solve_partial_desc()
+ * in src/puzzles.js) -- '0' means undetermined, anything else is a
+ * solved cell. Null/undefined (the solver being unavailable, or a failed
+ * request) counts as zero progress rather than throwing.
+ */
+function countForcedDigits(forcedDigitString) {
+    if (!forcedDigitString) return 0;
+    let count = 0;
+    for (let i = 0; i < forcedDigitString.length; i++) {
+        if (forcedDigitString[i] !== '0') count++;
+    }
+    return count;
+}
+
+/**
+ * Merge away any stage that adds no additional forced digits over the
+ * previous *kept* stage (forcedCounts[k] is stage[k]'s total forced-digit
+ * count, as measured by the real solver -- this module never solves
+ * anything itself, so the counts must come from the caller; see
+ * countForcedDigits() above and getForcedDigits()/solve_partial_desc in
+ * src/puzzles.js). A structural division can produce a group whose clue
+ * doesn't newly pin down any cell on its own -- very common for the
+ * very first group (a handful of addition/subtraction cages alone often
+ * force nothing), and possible near the end once the puzzle is already
+ * fully determined by an earlier group. Every "digit group" a player
+ * unlocks should actually teach them something, so those stages are
+ * folded into the next one instead of being shown as their own group.
+ *
+ * Cumulative masked descriptors already contain every earlier stage's
+ * cages, so dropping a no-progress stage k is exactly "merge its cages
+ * into the next kept stage" -- no re-division needed, just filtering.
+ *
+ * Returns a filtered stages array (same shape as buildStageDescriptors()'s
+ * `stages`), always length >= 1. (A valid Keen puzzle's true full
+ * descriptor always forces every cell -- see keen-solve-partial-test.c's
+ * verification -- so the last stage always adds progress over an empty
+ * start and this can't degenerate to zero real puzzles; the length-1
+ * fallback below is just a defensive backstop.)
+ */
+function mergeNoProgressStages(stages, forcedCounts) {
+    if (stages.length !== forcedCounts.length) {
+        throw new Error(`stages/forcedCounts length mismatch: ${stages.length} vs ${forcedCounts.length}`);
+    }
+    const kept = [];
+    let lastCount = 0;
+    for (let k = 0; k < stages.length; k++) {
+        if (forcedCounts[k] > lastCount) {
+            kept.push(stages[k]);
+            lastCount = forcedCounts[k];
+        }
+    }
+    if (kept.length === 0) {
+        kept.push(stages[stages.length - 1]);
+    }
+    return kept;
+}
+
 module.exports = {
     parseKeenDescriptor,
     buildMaskedDescriptor,
     touchingCagesByLine,
     divideCages,
     buildStageDescriptors,
+    rowColStartCandidates,
+    allLines,
+    lineKey,
+    combinations,
+    seededShuffleCopy,
+    countForcedDigits,
+    mergeNoProgressStages,
     _hashStringToSeed: hashStringToSeed,
     _mulberry32: mulberry32,
 };

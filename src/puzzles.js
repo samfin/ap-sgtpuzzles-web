@@ -9,7 +9,7 @@ const SaveData = require("./savedata.js");
 const {GameSave, getFile, getFileList, openDatabase} = SaveData;
 const {config} = require("config")
 const {genres, genreInfo} = require("./genres.js")
-const {parseKeenDescriptor, buildMaskedDescriptor, buildStageDescriptors} = require("./keenDivision.js")
+const {parseKeenDescriptor, buildMaskedDescriptor, touchingCagesByLine, rowColStartCandidates, allLines, lineKey, combinations, seededShuffleCopy, countForcedDigits, mergeNoProgressStages} = require("./keenDivision.js")
 
 document.addEventListener("alpine:init", onInit)
 
@@ -559,8 +559,27 @@ function keenDescriptorForCount(plan, unlockedCount) {
  * plan on the entry, so future loads/reveals for this puzzle instance
  * never need another hidden WASM resolution pass -- everything from here
  * on is pure-JS re-masking of the same parsed structure.
+ *
+ * Every stage is a whole number of rows/columns, not arbitrary cage
+ * chunks: stage 1 is one row plus one column (via
+ * rowColStartCandidates()), and every later stage adds exactly one more
+ * row or column -- whichever (searched over every not-yet-used line, in
+ * seeded-shuffled order) actually forces a new digit according to the
+ * real, unmodified solver (getForcedDigits()/solve_partial_desc(), via
+ * the same hidden puzzleframe this resolution pass already has loaded).
+ * If no single remaining line adds anything, the search escalates to
+ * pairs of remaining lines (rows and/or columns together); if even that
+ * fails, or the world's digit_group_count has been reached, the stage
+ * takes every remaining line at once, which always finishes the puzzle
+ * (a hidden cage's every cell has an unused row and an unused column by
+ * definition, so revealing every remaining line always reveals every
+ * remaining cage -- this is also what guarantees a player holding every
+ * Clue Set item for a puzzle always sees the complete thing, not a
+ * partially-clued dead end). mergeNoProgressStages() is still run as a
+ * final defensive pass, though by construction every stage here should
+ * already strictly increase its forced-digit count over the last.
  */
-function resolveKeenStagePlan(entry, gameId) {
+async function resolveKeenStagePlan(entry, gameId) {
     const colonIndex = gameId.indexOf(':');
     if (colonIndex === -1) {
         throw new Error(`Expected a full game id ("params:desc"), got: ${gameId}`);
@@ -574,9 +593,106 @@ function resolveKeenStagePlan(entry, gameId) {
     const w = parseInt(widthMatch[0], 10);
 
     const parsed = parseKeenDescriptor(desc, w);
-    const { achieved, stages } = buildStageDescriptors(parsed, entry.digitGroupCount, gameId);
+    const targetGroups = Math.max(1, Math.floor(entry.digitGroupCount || 1));
+    const allCageIds = parsed.cageOrder;
 
-    entry.stagePlan = { paramsStr, w, parsed, achieved, stages };
+    if (targetGroups <= 1 || allCageIds.length === 0) {
+        // No progressive reveal for this puzzle -- one stage, the whole
+        // thing, matching divideCages()'s own n<=1 behaviour.
+        entry.stagePlan = {
+            paramsStr, w, parsed, achieved: 1,
+            stages: [{ cageIds: new Set(allCageIds), descriptor: buildMaskedDescriptor(parsed, allCageIds) }],
+        };
+        return;
+    }
+
+    const { rows: touchingByRow, cols: touchingByCol } = touchingCagesByLine(parsed);
+    const cagesForLine = (line) => (line.type === 'row' ? touchingByRow[line.index] : touchingByCol[line.index]);
+
+    // Stage 1: one row + one column, whichever combination (tried in
+    // seeded-shuffled order) forces a digit first.
+    let startCandidate = null;
+    for (const candidate of rowColStartCandidates(parsed, gameId)) {
+        const result = await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidate.cageIds));
+        const forced = countForcedDigits(result);
+        if (startCandidate === null) startCandidate = candidate;
+        if (forced > 0) { startCandidate = candidate; break; }
+    }
+
+    const visible = new Set(startCandidate.cageIds);
+    const usedLines = new Set([`row:${startCandidate.row}`, `col:${startCandidate.col}`]);
+    const stages = [{ cageIds: new Set(visible), descriptor: buildMaskedDescriptor(parsed, visible) }];
+    const forcedCounts = [countForcedDigits(await getForcedDigits(paramsStr, stages[0].descriptor))];
+
+    const applyLines = (lines) => {
+        for (const line of lines) {
+            usedLines.add(lineKey(line));
+            for (const id of cagesForLine(line)) visible.add(id);
+        }
+    };
+
+    while (stages.length < targetGroups
+        && visible.size < allCageIds.length
+        && forcedCounts[forcedCounts.length - 1] < w * w) {
+        const remaining = allLines(w).filter(l => !usedLines.has(lineKey(l)));
+        if (remaining.length === 0) break;
+
+        const isFinalAllowedStage = stages.length === targetGroups - 1;
+        let chosenLines = null;
+        let chosenForced = null;
+
+        if (!isFinalAllowedStage) {
+            // Level 1: a single remaining row or column.
+            for (const line of seededShuffleCopy(remaining, `${gameId}:${stages.length}:line`)) {
+                const candidateVisible = new Set(visible);
+                for (const id of cagesForLine(line)) candidateVisible.add(id);
+                const result = await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidateVisible));
+                const forced = countForcedDigits(result);
+                if (forced > forcedCounts[forcedCounts.length - 1]) {
+                    chosenLines = [line];
+                    chosenForced = forced;
+                    break;
+                }
+            }
+
+            // Level 2: no single line helped -- try pairs of remaining
+            // lines (rows and/or columns together, same idea as stage 1).
+            if (!chosenLines && remaining.length >= 2) {
+                for (const pair of seededShuffleCopy(combinations(remaining, 2), `${gameId}:${stages.length}:pair`)) {
+                    const candidateVisible = new Set(visible);
+                    for (const line of pair) for (const id of cagesForLine(line)) candidateVisible.add(id);
+                    const result = await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidateVisible));
+                    const forced = countForcedDigits(result);
+                    if (forced > forcedCounts[forcedCounts.length - 1]) {
+                        chosenLines = pair;
+                        chosenForced = forced;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!chosenLines) {
+            // Either this is the last stage the world's digit_group_count
+            // allows (so it must be the complete puzzle regardless of
+            // what a smaller reveal would do), or neither a single line
+            // nor a pair helped -- either way, take every remaining line
+            // at once, which always finishes the puzzle (see doc comment
+            // above).
+            chosenLines = remaining;
+            const candidateVisible = new Set(visible);
+            for (const line of chosenLines) for (const id of cagesForLine(line)) candidateVisible.add(id);
+            chosenForced = countForcedDigits(await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidateVisible)));
+        }
+
+        applyLines(chosenLines);
+        stages.push({ cageIds: new Set(visible), descriptor: buildMaskedDescriptor(parsed, visible) });
+        forcedCounts.push(chosenForced);
+    }
+
+    const mergedStages = mergeNoProgressStages(stages, forcedCounts);
+
+    entry.stagePlan = { paramsStr, w, parsed, achieved: mergedStages.length, stages: mergedStages };
 }
 
 /**
@@ -717,17 +833,22 @@ function js_update_permalinks(gameId, gameSeed) {
         const entry = resolvingKeenEntry;
         resolvingKeenEntry = null;
 
-        try {
-            resolveKeenStagePlan(entry, gameId);
-        } catch (e) {
-            console.error(`Failed to compute clue-group division for puzzle ${entry.index}`, e);
-        }
+        (async () => {
+            try {
+                await resolveKeenStagePlan(entry, gameId);
+            } catch (e) {
+                console.error(`Failed to compute clue-group division for puzzle ${entry.index}`, e);
+            }
 
-        // Deferred so it runs *after* this (hidden) pass's own
-        // js_post_init() -- main() calls update_permalinks() before
-        // js_post_init(), and suppressNextReveal needs to stay true for
-        // the rest of this pass, only flipping for the next one.
-        setTimeout(() => {
+            // suppressNextReveal must stay true until this (hidden,
+            // about-to-be-thrown-away) pass's own js_post_init() has
+            // already fired -- main() calls update_permalinks() before
+            // js_post_init(). Every getForcedDigits() call inside
+            // resolveKeenStagePlan() is a real cross-frame postMessage
+            // round trip, so by the time we get here (whether that loop
+            // ran zero or several iterations) any already-queued
+            // js_post_init message from this same pass is guaranteed to
+            // have already been delivered and handled.
             suppressNextReveal = false;
             if (entry.stagePlan) {
                 loadPuzzle(entry.genre, keenVisibleId(entry), true, entry.index);
@@ -736,7 +857,7 @@ function js_update_permalinks(gameId, gameSeed) {
                 // puzzle rather than getting stuck on a blank frame.
                 loadPuzzle(entry.genre, entry.puzzleId || entry.puzzleSeed, true, entry.index);
             }
-        }, 0);
+        })();
     }
 }
 
