@@ -605,9 +605,11 @@ async function resolveKeenStagePlan(entry, gameId) {
     if (targetGroups <= 1 || allCageIds.length === 0) {
         // No progressive reveal for this puzzle -- one stage, the whole
         // thing, matching divideCages()'s own n<=1 behaviour.
+        const fullDescriptor = buildMaskedDescriptor(parsed, allCageIds);
+        const fullForcedDigits = await getForcedDigits(paramsStr, fullDescriptor);
         entry.stagePlan = {
             paramsStr, w, parsed, achieved: 1,
-            stages: [{ cageIds: new Set(allCageIds), descriptor: buildMaskedDescriptor(parsed, allCageIds) }],
+            stages: [{ cageIds: new Set(allCageIds), descriptor: fullDescriptor, forcedDigits: fullForcedDigits }],
         };
         return;
     }
@@ -628,7 +630,9 @@ async function resolveKeenStagePlan(entry, gameId) {
     const visible = new Set(startCandidate.cageIds);
     const usedLines = new Set([`row:${startCandidate.row}`, `col:${startCandidate.col}`]);
     const stages = [{ cageIds: new Set(visible), descriptor: buildMaskedDescriptor(parsed, visible) }];
-    const forcedCounts = [countForcedDigits(await getForcedDigits(paramsStr, stages[0].descriptor))];
+    const startForcedDigits = await getForcedDigits(paramsStr, stages[0].descriptor);
+    stages[0].forcedDigits = startForcedDigits;
+    const forcedCounts = [countForcedDigits(startForcedDigits)];
 
     const applyLines = (lines) => {
         for (const line of lines) {
@@ -646,6 +650,7 @@ async function resolveKeenStagePlan(entry, gameId) {
         const isFinalAllowedStage = stages.length === targetGroups - 1;
         let chosenLines = null;
         let chosenForced = null;
+        let chosenForcedDigits = null;
 
         if (!isFinalAllowedStage) {
             // Level 1: a single remaining row or column.
@@ -657,6 +662,7 @@ async function resolveKeenStagePlan(entry, gameId) {
                 if (forced > forcedCounts[forcedCounts.length - 1]) {
                     chosenLines = [line];
                     chosenForced = forced;
+                    chosenForcedDigits = result;
                     break;
                 }
             }
@@ -672,6 +678,7 @@ async function resolveKeenStagePlan(entry, gameId) {
                     if (forced > forcedCounts[forcedCounts.length - 1]) {
                         chosenLines = pair;
                         chosenForced = forced;
+                        chosenForcedDigits = result;
                         break;
                     }
                 }
@@ -688,11 +695,12 @@ async function resolveKeenStagePlan(entry, gameId) {
             chosenLines = remaining;
             const candidateVisible = new Set(visible);
             for (const line of chosenLines) for (const id of cagesForLine(line)) candidateVisible.add(id);
-            chosenForced = countForcedDigits(await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidateVisible)));
+            chosenForcedDigits = await getForcedDigits(paramsStr, buildMaskedDescriptor(parsed, candidateVisible));
+            chosenForced = countForcedDigits(chosenForcedDigits);
         }
 
         applyLines(chosenLines);
-        stages.push({ cageIds: new Set(visible), descriptor: buildMaskedDescriptor(parsed, visible) });
+        stages.push({ cageIds: new Set(visible), descriptor: buildMaskedDescriptor(parsed, visible), forcedDigits: chosenForcedDigits });
         forcedCounts.push(chosenForced);
     }
 
@@ -1081,16 +1089,24 @@ function toggleNextGroupHighlight() {
     const unlockedCount = isApReady() ? countReceivedClueSets(entry.index) : 0;
     if (unlockedCount >= plan.stages.length) return;
 
-    // stages[k] is cumulative (see keenDivision.js); the *next* digit
-    // group is whatever it adds beyond the last one the player already
-    // has (or beyond nothing, if they don't have any yet).
-    const previousCageIds = unlockedCount > 0 ? plan.stages[unlockedCount - 1].cageIds : new Set();
-    const nextCageIds = plan.stages[unlockedCount].cageIds;
+    // "Next digit group" means newly *deducible* cells, not just cells
+    // belonging to newly-visible cages: a new clue's constraint can pin
+    // down a cell in an already-visible cage (propagation), and a newly
+    // visible cage's own cells aren't necessarily solvable yet either.
+    // Each stage's real solver-forced digit string is precomputed and
+    // cached by resolveKeenStagePlan(); diff the next stage's against the
+    // currently-unlocked one's (or an all-undetermined baseline, if the
+    // player has no items for this puzzle yet) to get exactly the cells
+    // that become newly solvable -- i.e. what the player could fill in
+    // for their next Clue Set item.
+    const previousForced = unlockedCount > 0
+        ? plan.stages[unlockedCount - 1].forcedDigits
+        : "0".repeat(plan.w * plan.w);
+    const nextForced = plan.stages[unlockedCount].forcedDigits;
 
     const cells = [];
-    for (const cageId of nextCageIds) {
-        if (previousCageIds.has(cageId)) continue;
-        for (const cell of plan.parsed.cages.get(cageId).cells) cells.push(cell);
+    for (let i = 0; i < nextForced.length; i++) {
+        if (nextForced[i] !== "0" && previousForced[i] === "0") cells.push(i);
     }
 
     puzzleState.highlightingNextGroup = true;
