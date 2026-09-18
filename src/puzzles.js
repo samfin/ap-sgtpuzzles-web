@@ -67,6 +67,17 @@ class ArchipelagoPuzzle {
         this.item = options.item;
         this.state = "";
 
+        // True when this puzzle isn't solved yet but has at least one
+        // unlocked (item-received) Digit Group whose location hasn't
+        // been checked -- i.e. there's a clue group the player already
+        // has the items for and hasn't finished filling in yet, as
+        // opposed to a puzzle that's either fully caught up on
+        // everything currently unlocked or hasn't unlocked anything at
+        // all. Recomputed in syncAPStatus() (see there for why it only
+        // needs item/location state, not this puzzle's own stagePlan).
+        // Always false for freeplay puzzles (no digitGroupCount).
+        this.hasProgressAvailable = false;
+
         // Target number of clue-group stages for this puzzle (Archipelago's
         // "N", from slot_data.digit_group_counts); undefined for freeplay
         // puzzles, which have no progressive-reveal concept at all.
@@ -1603,6 +1614,30 @@ function syncAPStatus() {
                 currentFile.puzzleLocked[entry.index-1] = false;
                 fileDirty = true;
             }
+        }
+
+        // Sidebar highlight: does this puzzle have an unlocked Digit
+        // Group the player hasn't finished yet? Deliberately keyed
+        // purely off item/location state (how many "Clue Set" items
+        // have been received, and which "Puzzle N Digit Group G"
+        // locations are already checked) rather than this entry's own
+        // stagePlan, so it works for every puzzle in the list right
+        // away -- including ones never opened this session, whose
+        // stagePlan is still null (resolving it just to answer this
+        // would mean loading each one into the single shared iframe,
+        // which would interrupt whatever puzzle the player currently
+        // has open).
+        if (entry.digitGroupCount !== undefined) {
+            const unlockedCount = countReceivedClueSets(entry.index);
+            let progressAvailable = false;
+            for (let g = 1; g <= unlockedCount; g++) {
+                const groupLocationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
+                if (groupLocationId === undefined || !client.room.checkedLocations.includes(groupLocationId)) {
+                    progressAvailable = true;
+                    break;
+                }
+            }
+            entry.hasProgressAvailable = progressAvailable;
         }
 
         if (dirty) {

@@ -44,7 +44,8 @@
                     <li>
                         <button tabindex="0"
                         :class="['puzzle', entry == current ? 'selected' : null, entry.solved ? 'solved' : 'unsolved',
-entry.locked ? 'locked' : 'unlocked', entry.collected ? 'collected' : 'uncollected']"
+entry.locked ? 'locked' : 'unlocked', entry.collected ? 'collected' : 'uncollected',
+(!entry.solved && entry.hasProgressAvailable) ? 'progress-available' : null]"
                         @click="selectPuzzle(entry)"
                         :disabled="entry.locked && !$store.debugMode">
                             <span x-text="entry.index"></span>.

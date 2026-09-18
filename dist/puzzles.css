@@ -96,6 +96,20 @@ body {
         background-color: rgb(204, 255, 235);
     }
 
+    /* Not yet complete, but at least one already-unlocked Digit Group
+       hasn't been filled in and checked yet -- i.e. there's something
+       immediately actionable here, as opposed to a puzzle that's
+       either fully caught up on everything currently unlocked or
+       hasn't unlocked anything at all yet. Same pale yellow already
+       used for chat-line highlights elsewhere in this file. */
+    &.progress-available {
+        background-color: #ffc;
+    }
+
+    &.selected.progress-available {
+        background-color: rgb(238, 238, 204);
+    }
+
     &.collected {
         text-decoration: line-through;
     }
