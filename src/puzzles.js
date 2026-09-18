@@ -1151,15 +1151,30 @@ function toggleNextGroupHighlight() {
     if (!plan) return;
 
     const unlockedCount = isApReady() ? countReceivedClueSets(entry.index) : 0;
+    const reachableCount = Math.min(unlockedCount, plan.stages.length);
 
-    // "The next digit group" is the one the player has *just* unlocked
-    // enough items to see and needs to complete now -- Digit Group
-    // `unlockedCount` (1-indexed, per rules.py's `count(Clue Set) >= j`
-    // access rule) -- not some future group requiring items they don't
-    // have yet. With zero items, there's nothing deducible at all (an
-    // already-established invariant -- see Stage 1), so the highlight is
-    // correctly empty rather than an error.
-    const targetGroupNumber = Math.min(unlockedCount, plan.stages.length);
+    // "The next digit group" is the earliest unlocked group the player
+    // hasn't actually solved (checked) yet -- NOT necessarily the
+    // highest-numbered unlocked group. Items and solving progress are
+    // independent: nothing stops several "Clue Set" items for a puzzle
+    // from arriving before the player has caught up on solving the
+    // earlier groups they unlocked, so `unlockedCount` alone (how many
+    // items have been received) can overshoot how far the player has
+    // actually gotten. Walk the unlocked groups in order and highlight
+    // the first one that isn't already a checked location; if every
+    // unlocked group is already solved (or there are none), there's
+    // nothing to highlight -- correctly empty, not an error, same as
+    // the zero-items case.
+    let targetGroupNumber = 0;
+    if (isApReady()) {
+        for (let g = 1; g <= reachableCount; g++) {
+            const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
+            if (locationId === undefined || !client.room.checkedLocations.includes(locationId)) {
+                targetGroupNumber = g;
+                break;
+            }
+        }
+    }
     const cells = targetGroupNumber > 0 ? digitGroupCells(plan, targetGroupNumber) : [];
 
     puzzleState.highlightingNextGroup = true;
