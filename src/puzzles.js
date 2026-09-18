@@ -1177,6 +1177,17 @@ async function loadFile(file, secretMode, newConnection) {
         }
     }
 
+    if (connectOk) {
+        // Refresh digitGroupCounts from the server on every successful
+        // (re)connect, not just brand-new files: a file saved before this
+        // field existed (or before the world's digit_group_count option
+        // was what it is now) would otherwise be stuck with GameSave's
+        // Array(...).fill(1) default forever, which looks exactly like
+        // "every puzzle shows fully revealed" -- because with N=1, a
+        // single-stage division genuinely *is* full reveal.
+        file.digitGroupCounts = slotData.digit_group_counts;
+    }
+
     if (newConnection && connectOk) {
         file.host = host;
         file.port = port;
