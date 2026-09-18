@@ -958,7 +958,6 @@ function initPuzzle() {
                 var dpr = window.devicePixelRatio || 1;
                 var new_w = (event.pageX + resize_xoffset - resize_xbase) * dpr * 2;
                 var new_h = (event.pageY + resize_yoffset - resize_ybase) * dpr;
-                console.log("[resize-debug] live drag captured:", {new_w, new_h, dpr});
                 resize_puzzle(new_w, new_h);
                 // Let the parent page know the raw size that was just
                 // applied, in the same units resize_puzzle() itself
@@ -1044,27 +1043,52 @@ function post_init() {
     update_pixel_ratio();
 
     // Re-apply a size the player dragged the resize handle to earlier
-    // this session (see the mousemove handler above), now that the
-    // puzzle's own default sizing (update_pixel_ratio() -> rescale_puzzle()
-    // just above) has definitely already run. Doing this here --
-    // synchronously, in the same call, after that default-size logic --
-    // guarantees it always applies last, regardless of any browser's
-    // postMessage scheduling; a previous version of this feature applied
-    // the persisted size via an async postMessage round trip to the
-    // parent and back, which could occasionally lose a race against this
-    // same default-size logic (confirmed by a real report: swapping
-    // between two 9x9 puzzles sometimes landed on a size larger than
-    // what was persisted). resizeW/resizeH are read directly from this
-    // iframe's own query string at load time by static/puzzleframe.js
-    // (set by the parent's loadPuzzle() -- see persistedPuzzleSize
-    // there), rather than sent as a message, specifically so they're
-    // available synchronously here with no round trip at all.
-    console.log("[resize-debug] post_init applying persisted size:",
-                {resizeW, resizeH, dpr: window.devicePixelRatio,
-                 hasResizePuzzle: typeof resize_puzzle === "function"});
-    if (typeof resize_puzzle === "function" &&
-        resizeW !== null && resizeH !== null) {
-        resize_puzzle(resizeW, resizeH);
+    // this session (see the mousemove handler above). resizeW/resizeH
+    // are read directly from this iframe's own query string at load
+    // time by static/puzzleframe.js (set by the parent's loadPuzzle()
+    // -- see persistedPuzzleSize there), rather than sent as a
+    // postMessage, so they're available synchronously with no round
+    // trip at all -- a previous version of this feature replayed the
+    // size via an async round trip to the parent and back instead,
+    // which turned out not to be the real problem (see below), but was
+    // still worth removing in favor of this simpler, race-free path.
+    //
+    // This has to be reapplied a second time on this document's own
+    // "load" event. containing_div (see the resize_handler registered
+    // on "resize"/"load" a few lines up) gets re-measured when that
+    // event fires, specifically because -- per the existing comment
+    // there -- its size can be measured too early otherwise; that
+    // "load" event can land *after* this function has already run
+    // once. The re-measurement reads containing_div's *current*
+    // on-screen size, which by then reflects whatever we just resized
+    // the canvas to; since containing_div's own size tracks its
+    // content, that re-measurement can end up requesting something
+    // bigger than what was actually persisted. This was confirmed with
+    // real numbers from a live session: with no persisted size at all,
+    // a single fresh load's default sizing alone drifted from 336 to
+    // 480 across successive calls; with a persisted size of 592x545,
+    // it drifted from an initially-correct 538 up to 769 -- well past
+    // what was asked for -- specifically because of this "load"
+    // remeasurement landing after the persisted size had already been
+    // applied once. Reapplying our own target once more, after that
+    // listener has had its say, corrects it back -- harmless/idempotent
+    // (resize_puzzle() is a no-op if the size already matches) if there
+    // was nothing to correct. Deliberately only "load", not also
+    // "resize": "resize" can keep firing in response to layout changes
+    // this reapply itself causes, and unlike "load" (which only ever
+    // fires once) there's no guarantee that feedback settles rather
+    // than oscillating, so it's not worth the risk to additionally
+    // guard against a browser-window-resize scenario nobody has
+    // actually reported.
+    function reapplyPersistedResize() {
+        if (typeof resize_puzzle === "function" &&
+            resizeW !== null && resizeH !== null) {
+            resize_puzzle(resizeW, resizeH);
+        }
+    }
+    reapplyPersistedResize();
+    if (resizeW !== null && resizeH !== null) {
+        window.addEventListener("load", reapplyPersistedResize);
     }
 
     // If we get here with everything having gone smoothly, i.e.
