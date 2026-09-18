@@ -995,6 +995,22 @@ async function loadPuzzle(genre, id, singleMode, saveKey) {
     if (singleMode || !genre) {
         queryFragments.push({key: "s", value: "true"});
     }
+    // Thread a manually-resized window size through as query params
+    // rather than replaying it via a postMessage round trip after the
+    // iframe loads (see puzzleResized()/js_post_init() below for the
+    // capture side, which is unchanged). The iframe applies this
+    // synchronously, in the same call as its own default-size logic
+    // (see the end of post_init() in emccpre-ap.js) -- avoiding a race
+    // between "apply the puzzle's own default size" and "apply the
+    // persisted size" that a purely message-based replay is exposed to
+    // (confirmed by a real report: swapping between two 9x9 puzzles
+    // sometimes landed on a size larger than what was persisted,
+    // consistent with the default-size message occasionally winning
+    // that race instead of the replay).
+    if (genre && persistedPuzzleSize) {
+        queryFragments.push({key: "rw", value: String(persistedPuzzleSize.w)});
+        queryFragments.push({key: "rh", value: String(persistedPuzzleSize.h)});
+    }
 
     let queryString = queryFragments.map(e => `${e.key}=${encodeURIComponent(e.value)}`).join("&");
 
@@ -1028,12 +1044,10 @@ function js_post_init() {
         // progress or enable controls against it.
         return;
     }
-    if (persistedPuzzleSize) {
-        // Re-apply a size the player dragged the resize handle to
-        // earlier this session, since this fresh iframe load just
-        // reset back to the puzzle's default size.
-        sendMessage("resizePuzzle", persistedPuzzleSize.w, persistedPuzzleSize.h);
-    }
+    // A persisted resize (if any) is applied inside the iframe itself,
+    // synchronously at boot, from the rw/rh query params loadPuzzle()
+    // added above -- see the end of post_init() in emccpre-ap.js. No
+    // reply needed from here.
     loadPuzzleData();
     Alpine.store("puzzleState").loaded = true;
 }

@@ -925,11 +925,11 @@ function initPuzzle() {
         var resize_xbase = null, resize_ybase = null, restore_pending = false;
         var resize_xoffset = null, resize_yoffset = null;
         // Assigned without `var` -- these are true top-level vars (see
-        // the comment above solve_partial_desc etc.) so that
-        // static/puzzleframe.js can also call them directly, to replay
-        // a persisted user-chosen size onto a freshly loaded puzzle
-        // (see resizePuzzle() there and puzzleResized()/js_post_init()
-        // in src/puzzles.js).
+        // the comment above solve_partial_desc etc.) so that this
+        // module's own post_init() (below) can call resize_puzzle
+        // directly to replay a persisted user-chosen size onto a
+        // freshly loaded puzzle (see the end of post_init(), and
+        // puzzleResized() in src/puzzles.js for the capture side).
         resize_puzzle = Module.cwrap('resize_puzzle',
                                      'void', ['number', 'number']);
         restore_puzzle_size = Module.cwrap('restore_puzzle_size',
@@ -1041,6 +1041,28 @@ function post_init() {
     }
 
     update_pixel_ratio();
+
+    // Re-apply a size the player dragged the resize handle to earlier
+    // this session (see the mousemove handler above), now that the
+    // puzzle's own default sizing (update_pixel_ratio() -> rescale_puzzle()
+    // just above) has definitely already run. Doing this here --
+    // synchronously, in the same call, after that default-size logic --
+    // guarantees it always applies last, regardless of any browser's
+    // postMessage scheduling; a previous version of this feature applied
+    // the persisted size via an async postMessage round trip to the
+    // parent and back, which could occasionally lose a race against this
+    // same default-size logic (confirmed by a real report: swapping
+    // between two 9x9 puzzles sometimes landed on a size larger than
+    // what was persisted). resizeW/resizeH are read directly from this
+    // iframe's own query string at load time by static/puzzleframe.js
+    // (set by the parent's loadPuzzle() -- see persistedPuzzleSize
+    // there), rather than sent as a message, specifically so they're
+    // available synchronously here with no round trip at all.
+    if (typeof resize_puzzle === "function" &&
+        resizeW !== null && resizeH !== null) {
+        resize_puzzle(resizeW, resizeH);
+    }
+
     // If we get here with everything having gone smoothly, i.e.
     // we haven't crashed for one reason or another during setup, then
     // it's probably safe to hide the 'sorry, no puzzle here' div and
