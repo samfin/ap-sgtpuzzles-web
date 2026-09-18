@@ -219,6 +219,18 @@ function setDigitGroupHighlight(cells, w) {
     }
 }
 
+// Re-applies a puzzle-window size the parent captured from an earlier
+// resize (see puzzleResized in src/puzzles.js), so a manually-resized
+// window keeps its size across switching to another puzzle and back.
+// resize_puzzle is only defined once initPuzzle() has run for the
+// current genre's script (exposed as a top-level var -- see the
+// comment on its declaration in emccpre-ap.js), so guard against it
+// not existing yet.
+function resizePuzzle(w, h) {
+    if (typeof resize_puzzle !== "function") return;
+    resize_puzzle(w, h);
+}
+
 const messageHandlers = {
     loadPuzzle, setPreset, showPreferences,
     puzzleFromId, puzzleFromSeed,
@@ -226,7 +238,8 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData,
-    getForcedDigits, setDigitGroupHighlight, getCurrentGrid, revealClues
+    getForcedDigits, setDigitGroupHighlight, getCurrentGrid, revealClues,
+    resizePuzzle
 }
 
 function processMessage(message) {

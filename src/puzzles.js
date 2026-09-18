@@ -29,6 +29,19 @@ let resolvingKeenEntry = null;
 // before the *next* (real, masked-to-the-player) load is kicked off.
 let suppressNextReveal = false;
 
+// The exact {w, h} arguments most recently passed to the native
+// resize_puzzle(w, h) while the player was dragging the puzzle window's
+// resize handle (see puzzleResized below), or null if the player hasn't
+// resized (or has right-click-restored to the default size) this
+// session. Deliberately module-level rather than per-entry: it survives
+// switching puzzles so a manually-chosen size sticks across the whole
+// session, matching what the user asked for, but it's in-memory only --
+// it does not survive a page reload. Reapplied in js_post_init() after
+// every puzzle (re)load, since loadPuzzle() reloads the iframe document
+// from scratch each time and so always starts back at the puzzle's
+// default size.
+let persistedPuzzleSize = null;
+
 /**
  * @type{import("archipelago.js").JSONRecord}
  */
@@ -1015,8 +1028,26 @@ function js_post_init() {
         // progress or enable controls against it.
         return;
     }
+    if (persistedPuzzleSize) {
+        // Re-apply a size the player dragged the resize handle to
+        // earlier this session, since this fresh iframe load just
+        // reset back to the puzzle's default size.
+        sendMessage("resizePuzzle", persistedPuzzleSize.w, persistedPuzzleSize.h);
+    }
     loadPuzzleData();
     Alpine.store("puzzleState").loaded = true;
+}
+
+// The iframe reports back here (see the puzzleResized sendMessage calls
+// added to ap-sgtpuzzles/emccpre-ap.js's resize-handle drag/restore
+// handlers) whenever the player finishes dragging the puzzle window's
+// resize corner, or right-clicks it to restore the default size. w/h
+// are the exact raw arguments the native resize_puzzle(w, h) was just
+// called with (not derived/recomputed here), so replaying them via
+// js_post_init() above reproduces the same size exactly; null/null
+// means "restored to default", i.e. stop persisting a size at all.
+function puzzleResized(w, h) {
+    persistedPuzzleSize = (w === null || h === null) ? null : {w, h};
 }
 
 function js_enable_undo_redo(enableUndo, enableRedo) {
@@ -1245,7 +1276,7 @@ const messageHandlers = {
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
     savePuzzleDataCallback, getForcedDigitsCallback, getCurrentGridCallback,
-    revealCluesCallback, loadPuzzleDataCallback
+    revealCluesCallback, loadPuzzleDataCallback, puzzleResized
 }
 
 function processMessage(message) {

@@ -259,6 +259,7 @@ var load_game
 var solve_partial_desc, free_solve_partial
 var get_current_grid, free_current_grid
 var reveal_clues
+var resize_puzzle, restore_puzzle_size
 
 // The <form> encapsulating the menus.  Used by
 // js_get_selected_preset() and js_select_preset().
@@ -923,10 +924,16 @@ function initPuzzle() {
         var resize_handle = document.getElementById("resizehandle");
         var resize_xbase = null, resize_ybase = null, restore_pending = false;
         var resize_xoffset = null, resize_yoffset = null;
-        var resize_puzzle = Module.cwrap('resize_puzzle',
-                                         'void', ['number', 'number']);
-        var restore_puzzle_size = Module.cwrap('restore_puzzle_size',
-                                               'void', []);
+        // Assigned without `var` -- these are true top-level vars (see
+        // the comment above solve_partial_desc etc.) so that
+        // static/puzzleframe.js can also call them directly, to replay
+        // a persisted user-chosen size onto a freshly loaded puzzle
+        // (see resizePuzzle() there and puzzleResized()/js_post_init()
+        // in src/puzzles.js).
+        resize_puzzle = Module.cwrap('resize_puzzle',
+                                     'void', ['number', 'number']);
+        restore_puzzle_size = Module.cwrap('restore_puzzle_size',
+                                           'void', []);
         resize_handle.oncontextmenu = function(event) { return false; }
         resize_handle.onpointerdown = function(event) {
             resize_handle.setPointerCapture(event.pointerId);
@@ -949,9 +956,17 @@ function initPuzzle() {
         window.addEventListener("mousemove", function(event) {
             if (resize_xbase !== null && resize_ybase !== null) {
                 var dpr = window.devicePixelRatio || 1;
-                resize_puzzle(
-                    (event.pageX + resize_xoffset - resize_xbase) * dpr * 2,
-                    (event.pageY + resize_yoffset - resize_ybase) * dpr);
+                var new_w = (event.pageX + resize_xoffset - resize_xbase) * dpr * 2;
+                var new_h = (event.pageY + resize_yoffset - resize_ybase) * dpr;
+                resize_puzzle(new_w, new_h);
+                // Let the parent page know the raw size that was just
+                // applied, in the same units resize_puzzle() itself
+                // takes, so it can replay this exact call the next time
+                // any puzzle loads (see puzzleResized() in
+                // src/puzzles.js) -- persisting the drag across puzzle
+                // switches, which otherwise reset to each puzzle's own
+                // default size on every load.
+                sendMessage("puzzleResized", new_w, new_h);
                 event.preventDefault();
                 // Chrome insists on selecting text during a resize drag
                 // no matter what I do
@@ -976,6 +991,11 @@ function initPuzzle() {
                 setTimeout(function() {
                     restore_pending = false;
                     restore_puzzle_size();
+                    // Clear whatever size was persisted from an earlier
+                    // drag, so the next puzzle loaded starts at ITS OWN
+                    // default size too, rather than snapping back to the
+                    // size just explicitly discarded here.
+                    sendMessage("puzzleResized", null, null);
                     onscreen_canvas.focus();
                 }, 20);
                 event.preventDefault();
