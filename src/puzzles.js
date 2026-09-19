@@ -91,6 +91,17 @@ class ArchipelagoPuzzle {
         // Always false for freeplay puzzles (no digitGroupCount).
         this.hasProgressAvailable = false;
 
+        // Sidebar "(checked/available)" counter: how many of this
+        // puzzle's Digit Group locations are checked, and how many are
+        // currently reachable at all (checked or not) given "Clue Set"
+        // items received so far -- e.g. (5/8) for a puzzle with 5
+        // solved groups and 3 more already unlocked but not yet filled
+        // in. Recomputed alongside hasProgressAvailable in
+        // syncAPStatus(); undefined (shown as nothing) for freeplay
+        // puzzles, same as hasProgressAvailable.
+        this.checkedGroupCount = 0;
+        this.availableGroupCount = 0;
+
         // Target number of clue-group stages for this puzzle (Archipelago's
         // "N", from slot_data.digit_group_counts); undefined for freeplay
         // puzzles, which have no progressive-reveal concept at all.
@@ -1753,16 +1764,17 @@ function syncAPStatus() {
         // which would interrupt whatever puzzle the player currently
         // has open).
         if (entry.digitGroupCount !== undefined) {
-            const unlockedCount = countReceivedClueSets(entry.index);
-            let progressAvailable = false;
-            for (let g = 1; g <= unlockedCount; g++) {
+            const availableCount = Math.min(countReceivedClueSets(entry.index), entry.digitGroupCount);
+            let checkedCount = 0;
+            for (let g = 1; g <= availableCount; g++) {
                 const groupLocationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
-                if (groupLocationId === undefined || !client.room.checkedLocations.includes(groupLocationId)) {
-                    progressAvailable = true;
-                    break;
+                if (groupLocationId !== undefined && client.room.checkedLocations.includes(groupLocationId)) {
+                    checkedCount++;
                 }
             }
-            entry.hasProgressAvailable = progressAvailable;
+            entry.checkedGroupCount = checkedCount;
+            entry.availableGroupCount = availableCount;
+            entry.hasProgressAvailable = checkedCount < availableCount;
         }
 
         if (dirty) {
