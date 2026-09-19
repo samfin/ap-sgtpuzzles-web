@@ -1013,11 +1013,6 @@ function initPuzzle() {
      */
     if (containing_div !== null) {
         var resize_handler = function(event) {
-            console.log("[resize-debug] resize_handler fired at " +
-                performance.now().toFixed(1) + "ms, event=" + event.type +
-                ", containing_div=" + containing_div.clientWidth + "x" +
-                containing_div.clientHeight + ", resizeW/H=" + resizeW +
-                "/" + resizeH);
             rescale_puzzle();
         }
         window.addEventListener("resize", resize_handler);
@@ -1053,52 +1048,26 @@ function post_init() {
     // time by static/puzzleframe.js (set by the parent's loadPuzzle()
     // -- see persistedPuzzleSize there), rather than sent as a
     // postMessage, so they're available synchronously with no round
-    // trip at all -- a previous version of this feature replayed the
-    // size via an async round trip to the parent and back instead,
-    // which turned out not to be the real problem (see below), but was
-    // still worth removing in favor of this simpler, race-free path.
+    // trip at all.
     //
-    // This has to be reapplied a second time on this document's own
-    // "load" event. containing_div (see the resize_handler registered
-    // on "resize"/"load" a few lines up) gets re-measured when that
-    // event fires, specifically because -- per the existing comment
-    // there -- its size can be measured too early otherwise; that
-    // "load" event can land *after* this function has already run
-    // once. The re-measurement reads containing_div's *current*
-    // on-screen size, which by then reflects whatever we just resized
-    // the canvas to; since containing_div's own size tracks its
-    // content, that re-measurement can end up requesting something
-    // bigger than what was actually persisted. This was confirmed with
-    // real numbers from a live session: with no persisted size at all,
-    // a single fresh load's default sizing alone drifted from 336 to
-    // 480 across successive calls; with a persisted size of 592x545,
-    // it drifted from an initially-correct 538 up to 769 -- well past
-    // what was asked for -- specifically because of this "load"
-    // remeasurement landing after the persisted size had already been
-    // applied once. Reapplying our own target once more, after that
-    // listener has had its say, corrects it back -- harmless/idempotent
-    // (resize_puzzle() is a no-op if the size already matches) if there
-    // was nothing to correct. Deliberately only "load", not also
-    // "resize": "resize" can keep firing in response to layout changes
-    // this reapply itself causes, and unlike "load" (which only ever
-    // fires once) there's no guarantee that feedback settles rather
-    // than oscillating, so it's not worth the risk to additionally
-    // guard against a browser-window-resize scenario nobody has
-    // actually reported.
-    function reapplyPersistedResize(tag) {
-        console.log("[resize-debug] reapplyPersistedResize(" + tag +
-            ") at " + performance.now().toFixed(1) + "ms, resizeW/H=" +
-            resizeW + "/" + resizeH);
-        if (typeof resize_puzzle === "function" &&
-            resizeW !== null && resizeH !== null) {
-            resize_puzzle(resizeW, resizeH);
-        }
-    }
-    reapplyPersistedResize("immediate");
-    if (resizeW !== null && resizeH !== null) {
-        window.addEventListener("load", function(event) {
-            reapplyPersistedResize("load-listener");
-        });
+    // This is *not* the last word on the puzzle's size, though: a
+    // second, later reapply lives in loadPuzzleData() in
+    // static/puzzleframe.js, and that one -- not this one -- is the
+    // one that actually has to fight containing_div growth. See the
+    // comment there for the full story (it was tracked down with live
+    // debug logging plus a read of resize()/load_game() in
+    // emcc-ap.c): earlier theories about a stray window "load"/"resize"
+    // event being responsible for the growth were disproved by that
+    // logging (neither ever fired between this call and the observed
+    // overshoot) -- the real second offender is a native call chain
+    // (loadPuzzleData() -> load_game() -> resize()) that runs *after*
+    // this function returns, so it can't be fixed from here at all.
+    // This immediate call still matters, though: it's what makes an
+    // ordinary puzzle load (no saved progress, so loadPuzzleData()
+    // never calls load_game()) land on the persisted size at all.
+    if (typeof resize_puzzle === "function" &&
+        resizeW !== null && resizeH !== null) {
+        resize_puzzle(resizeW, resizeH);
     }
 
     // If we get here with everything having gone smoothly, i.e.

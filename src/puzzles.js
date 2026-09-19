@@ -1190,9 +1190,6 @@ function js_canvas_remove_statusbar() {
 }
 
 function js_canvas_set_size(w, h) {
-    console.log("[resize-debug] js_canvas_set_size(" + w + ", " + h +
-        ") at " + performance.now().toFixed(1) +
-        "ms, suppressNextReveal=" + suppressNextReveal);
     if (suppressNextReveal) {
         // Hidden resolution pass -- keep the iframe collapsed so the
         // player never sees the fully-clued puzzle this pass generates.

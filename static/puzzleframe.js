@@ -130,6 +130,37 @@ function loadPuzzleData(data) {
     load_game(); // defined in {genre}.js
     savefile_read_callback = null;
 
+    // load_game() above (see its definition in emcc-ap.c) ends by
+    // calling resize() itself, using whatever the *current* on-screen
+    // size of containing_div happens to be. That's a problem
+    // specifically when the player has a manually-resized/persisted
+    // size in effect for this load (resizeW/resizeH, set from this
+    // iframe's own query string -- see the top of this file, and
+    // post_init() in emccpre-ap.js, which reapplies that size once
+    // already, earlier in boot): containing_div wraps snugly around
+    // the canvas, so by the time load_game() re-measures it, it
+    // reflects whatever size post_init() just set the canvas to, and
+    // asking again based on that measurement can land on something
+    // bigger than what was actually persisted (confirmed live: a
+    // persisted 592x545 correctly produced 538, then this exact call
+    // pushed it to 769 -- a real, reproducible overshoot, not a
+    // one-off). post_init()'s own reapply can't fix this on its own:
+    // it runs *before* this function does (loadPuzzleData() is only
+    // invoked once the parent has heard back that post_init() already
+    // ran -- see js_post_init() in src/puzzles.js), so this is the
+    // last point in the normal boot sequence where a stray resize()
+    // can happen, and therefore the last point where we can still put
+    // our target back. (An earlier attempt fixed this by reapplying on
+    // this document's "load" event instead, on the theory that a
+    // delayed containing_div remeasurement there was the culprit; live
+    // debug logging showed that event never actually fires between the
+    // correct apply and the overshoot, disproving that theory -- this
+    // load_game() call is the actual, and only, second offender.)
+    if (typeof resize_puzzle === "function" &&
+        resizeW !== null && resizeH !== null) {
+        resize_puzzle(resizeW, resizeH);
+    }
+
     // Let the parent know the restore has actually landed (load_game()
     // above is synchronous), so it can safely run any post-restore
     // logic that depends on the restored state actually being live --
