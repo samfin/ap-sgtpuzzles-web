@@ -65,7 +65,7 @@ export class GameSave {
          * Locked status of puzzles.
          * @type {boolean[]}
          */
-        // No puzzle-level "unlock" item exists in the sgtkeen item table
+        // No puzzle-level "unlock" item exists in the Progressive Keen item table
         // (only per-puzzle "Clue Set" items, which gate Digit Groups within an
         // already-available puzzle) -- default to unlocked.
         this.puzzleLocked = options.puzzleLocked ?? Array(this.puzzles.length).fill(false)

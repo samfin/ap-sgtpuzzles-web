@@ -61,6 +61,17 @@ function newPuzzle() {
 
 function restartPuzzle() {
     command(6);
+    // command(6) (native "Restart", see emcc-ap.c) is synchronous, but
+    // it reconstructs the puzzle from the *original* game descriptor
+    // (see midend_restart_game() in midend.c, which deliberately
+    // rebuilds from me->desc rather than reusing states[0] -- upstream
+    // behaviour, not specific to this fork) -- and that descriptor is
+    // whatever mask was baked in when this puzzle was first loaded,
+    // before any clues were revealed live via revealClues(). So a
+    // restart silently wipes any clue reveals that happened since load
+    // (see restartPuzzle() in src/puzzles.js, which re-reveals
+    // whatever should currently be visible once it hears this back).
+    sendMessage("restartPuzzleCallback");
 }
 
 function undoPuzzle() {

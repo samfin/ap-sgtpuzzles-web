@@ -136,7 +136,7 @@ class ArchipelagoPuzzle {
         // driven by comparing the player's live entered digits against
         // each Digit Group's own solver-forced cells -- not here. This
         // used to call client.check() on a "Puzzle N Reward" location,
-        // but no such location exists in sgtkeen's location table (every
+        // but no such location exists in Progressive Keen's location table (every
         // location is "Puzzle {i} Digit Group {j}"), so that call was
         // always checking client.check(undefined) and never sent
         // anything.
@@ -1290,7 +1290,7 @@ const messageHandlers = {
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
     savePuzzleDataCallback, getForcedDigitsCallback, getCurrentGridCallback,
-    revealCluesCallback, loadPuzzleDataCallback, puzzleResized
+    revealCluesCallback, loadPuzzleDataCallback, restartPuzzleCallback, puzzleResized
 }
 
 function processMessage(message) {
@@ -1332,8 +1332,41 @@ function puzzleFromSeed() {
     sendMessage("puzzleFromSeed")
 }
 
-function restartPuzzle() {
-    sendMessage("restartPuzzle");
+// Resolved once the iframe confirms a just-sent "restartPuzzle" has
+// actually landed (see restartPuzzleCallback below) -- needed so
+// restartPuzzle() can reliably re-reveal clues only after the restarted
+// game state is actually live, not merely dispatched.
+let pendingRestartPuzzleResolve = null;
+
+function restartPuzzleCallback() {
+    if (pendingRestartPuzzleResolve) {
+        let resolve = pendingRestartPuzzleResolve;
+        pendingRestartPuzzleResolve = null;
+        resolve();
+    }
+}
+
+async function restartPuzzle() {
+    await new Promise((resolve) => {
+        pendingRestartPuzzleResolve = resolve;
+        sendMessage("restartPuzzle");
+    });
+
+    // Bug: native "Restart" reconstructs the puzzle from its original
+    // game descriptor (see the comment on restartPuzzle() in
+    // static/puzzleframe.js), which is whatever clue mask was baked in
+    // when this puzzle was first loaded -- so restarting silently wipes
+    // any clues revealed live since then (from receiving items while
+    // this puzzle was open, or from catching up a stale save on
+    // restore -- see loadPuzzleData() above). Same fix as that: force
+    // a fresh check by clearing entry.displayedClueCount, then let
+    // liveRevealClues() re-reveal whatever should currently be visible
+    // (harmless no-op if nothing was actually lost).
+    const entry = Alpine.store("puzzleList").current;
+    if (entry?.stagePlan) {
+        entry.displayedClueCount = 0;
+        await liveRevealClues(entry);
+    }
 }
 
 function undoPuzzle() {
@@ -1634,7 +1667,7 @@ function syncAPStatus() {
 
         // "Collected" means every Digit Group location for this puzzle has
         // been checked -- there's no separate "Reward" location in
-        // sgtkeen's location table (every location is
+        // Progressive Keen's location table (every location is
         // "Puzzle {i} Digit Group {j}"), and checkDigitGroupProgress()'s
         // own K<N handling guarantees that once a puzzle is fully and
         // correctly solved, every group up through digitGroupCount gets
@@ -2171,7 +2204,7 @@ async function connectAP(hostname, port, player, password) {
     };
 
     let connectionURL = `${hostname}:${port}`
-    const game = "sgtkeen"
+    const game = "Progressive Keen"
 
     slotData = await client.login(connectionURL, player, game, connectionInfo);
 
@@ -2197,19 +2230,19 @@ function initRemoteSolves() {
 }
 
 function itemIdToName(id) {
-    return client.package.findPackage("sgtkeen").reverseItemTable[id]
+    return client.package.findPackage("Progressive Keen").reverseItemTable[id]
 }
 
 function itemNameToId(name) {
-    return client.package.findPackage("sgtkeen").itemTable[name]
+    return client.package.findPackage("Progressive Keen").itemTable[name]
 }
 
 function locationIdToName(id) {
-    return client.package.findPackage("sgtkeen").reverseLocationTable[id]
+    return client.package.findPackage("Progressive Keen").reverseLocationTable[id]
 }
 
 function locationNameToId(name) {
-    return client.package.findPackage("sgtkeen").locationTable[name]
+    return client.package.findPackage("Progressive Keen").locationTable[name]
 }
 
 function playerIdToName(id) {
@@ -2241,7 +2274,7 @@ function loadFileData(file, secretMode) {
     puzzleList.sortBySolved = !isFreeplay;
 
     for (let i = 0; i < file.puzzles.length; i++) {
-        // NOTE: sgtkeen has no per-puzzle "unlock" item -- every puzzle is
+        // NOTE: Progressive Keen has no per-puzzle "unlock" item -- every puzzle is
         // available to attempt from the start; only individual Digit Groups
         // within a puzzle are gated by "Puzzle {i+1} Clue Set" items. So we
         // deliberately ignore file.puzzleLocked here rather than reading a
