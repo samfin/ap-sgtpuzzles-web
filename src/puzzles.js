@@ -335,10 +335,13 @@ function initStores() {
         genreInfo: genreInfo["none"],
         gameId: "",
         gameSeed: "",
-        // Whether the "highlight next digit group" overlay is currently
-        // showing in the puzzleframe iframe (see toggleNextGroupHighlight()).
-        // Reset whenever a new puzzle loads, since a fresh iframe document
-        // never carries the previous one's overlay over.
+        // Whether the player wants the "highlight next digit group"
+        // overlay shown (see toggleNextGroupHighlight()). Deliberately
+        // NOT reset by reset() below, so the preference persists across
+        // puzzle switches -- a fresh iframe document never carries the
+        // previous one's overlay over regardless, so js_post_init()
+        // re-sends it for the newly-loaded puzzle whenever this is true
+        // (see refreshNextGroupHighlight()).
         highlightingNextGroup: false,
         reset() {
             this.solved = false;
@@ -354,7 +357,6 @@ function initStores() {
             this.genreInfo = genreInfo["none"];
             this.gameId = "";
             this.gameSeed = "";
-            this.highlightingNextGroup = false;
         }
     })
 
@@ -1050,6 +1052,12 @@ function js_post_init() {
     // reply needed from here.
     loadPuzzleData();
     Alpine.store("puzzleState").loaded = true;
+    // Re-send the "highlight next digit group" overlay for this
+    // freshly-loaded puzzle if the player had it turned on -- see
+    // refreshNextGroupHighlight()'s doc comment for why this is needed
+    // at all (a fresh iframe never carries the previous one's overlay
+    // over, even though the on/off preference itself now persists).
+    refreshNextGroupHighlight(Alpine.store("puzzleList").current);
 }
 
 // The iframe reports back here (see the puzzleResized sendMessage calls
@@ -1386,19 +1394,6 @@ function solvePuzzle() {
 }
 
 /**
- * Toggle a highlight overlay (drawn in the puzzleframe iframe, on top of
- * the puzzle canvas) over every cell in the next not-yet-unlocked digit
- * group -- regardless of whether those cells happen to be filled in or
- * already correct, since the point is to show the player *where* the
- * next group of clues will land, not to grade their current progress.
- *
- * A no-op for anything that isn't a resolved progressive-reveal Keen
- * puzzle: freeplay puzzles and other genres never get a stagePlan, a
- * Keen puzzle whose stagePlan hasn't been resolved yet (still mid
- * hidden-resolution-pass) doesn't have one either, and a puzzle whose
- * every digit group is already unlocked has no "next" group to show.
- */
-/**
  * The cell indices belonging to Digit Group `groupNumber` (1-indexed)
  * alone -- i.e. newly deducible there compared to the group before it
  * (or an all-undetermined baseline, for group 1) -- using each stage's
@@ -1425,34 +1420,32 @@ function digitGroupCells(plan, groupNumber) {
     return cells;
 }
 
-function toggleNextGroupHighlight() {
-    const puzzleState = Alpine.store("puzzleState");
-
-    if (puzzleState.highlightingNextGroup) {
-        puzzleState.highlightingNextGroup = false;
-        sendMessage("setDigitGroupHighlight", null);
-        return;
-    }
-
-    const entry = Alpine.store("puzzleList").current;
+// The cell indices to highlight for `entry`'s "next digit group" right
+// now -- shared by toggleNextGroupHighlight() (turning the overlay on)
+// and refreshNextGroupHighlight() below (recomputing it later without
+// the player having to toggle anything), so the two can never disagree
+// about which group is "next". Returns [] (nothing to highlight) if
+// entry has no resolved stagePlan.
+//
+// "The next digit group" is the earliest unlocked group the player
+// hasn't actually solved (checked) yet -- NOT necessarily the
+// highest-numbered unlocked group. Items and solving progress are
+// independent: nothing stops several "Clue Set" items for a puzzle
+// from arriving before the player has caught up on solving the
+// earlier groups they unlocked, so `unlockedCount` alone (how many
+// items have been received) can overshoot how far the player has
+// actually gotten. Walk the unlocked groups in order and highlight
+// the first one that isn't already a checked location; if every
+// unlocked group is already solved (or there are none), there's
+// nothing to highlight -- correctly empty, not an error, same as
+// the zero-items case.
+function nextGroupHighlightCells(entry) {
     const plan = entry && entry.stagePlan;
-    if (!plan) return;
+    if (!plan) return [];
 
     const unlockedCount = isApReady() ? countReceivedClueSets(entry.index) : 0;
     const reachableCount = Math.min(unlockedCount, plan.stages.length);
 
-    // "The next digit group" is the earliest unlocked group the player
-    // hasn't actually solved (checked) yet -- NOT necessarily the
-    // highest-numbered unlocked group. Items and solving progress are
-    // independent: nothing stops several "Clue Set" items for a puzzle
-    // from arriving before the player has caught up on solving the
-    // earlier groups they unlocked, so `unlockedCount` alone (how many
-    // items have been received) can overshoot how far the player has
-    // actually gotten. Walk the unlocked groups in order and highlight
-    // the first one that isn't already a checked location; if every
-    // unlocked group is already solved (or there are none), there's
-    // nothing to highlight -- correctly empty, not an error, same as
-    // the zero-items case.
     let targetGroupNumber = 0;
     if (isApReady()) {
         for (let g = 1; g <= reachableCount; g++) {
@@ -1463,10 +1456,64 @@ function toggleNextGroupHighlight() {
             }
         }
     }
-    const cells = targetGroupNumber > 0 ? digitGroupCells(plan, targetGroupNumber) : [];
+    return targetGroupNumber > 0 ? digitGroupCells(plan, targetGroupNumber) : [];
+}
+
+/**
+ * Re-send the "highlight next digit group" overlay for `entry`, using
+ * whatever's currently the next unlocked-but-unsolved group -- but only
+ * if the player actually has the highlight turned on
+ * (puzzleState.highlightingNextGroup); a harmless no-op otherwise so
+ * every call site below can call this unconditionally without checking
+ * that itself. Two callers:
+ *  - js_post_init(), once a freshly-loaded puzzle is actually ready, so
+ *    the setting persists across a puzzle switch instead of just
+ *    silently going blank on the new iframe (a fresh iframe document
+ *    never carries the previous one's overlay over on its own).
+ *  - syncAPStatus(), on every item-receipt/location-check sync, so
+ *    finishing the currently-highlighted group's cells moves the
+ *    highlight on to the next one immediately, without the player
+ *    having to toggle the button off and back on to recompute it.
+ */
+function refreshNextGroupHighlight(entry) {
+    const puzzleState = Alpine.store("puzzleState");
+    if (!puzzleState.highlightingNextGroup) return;
+
+    const plan = entry && entry.stagePlan;
+    sendMessage("setDigitGroupHighlight", nextGroupHighlightCells(entry), plan && plan.w);
+}
+
+/**
+ * Toggle a highlight overlay (drawn in the puzzleframe iframe, on top of
+ * the puzzle canvas) over every cell in the current "next digit group"
+ * -- regardless of whether those cells happen to be filled in or
+ * already correct, since the point is to show the player *where* the
+ * next group of clues will land, not to grade their current progress.
+ * See nextGroupHighlightCells() for exactly which group counts as
+ * "next". A no-op (leaves the highlight off) if the current puzzle has
+ * no resolved stagePlan: freeplay puzzles and other genres never get
+ * one, and neither does a Keen puzzle still mid hidden-resolution-pass.
+ *
+ * The on/off state this sets (puzzleState.highlightingNextGroup)
+ * persists across puzzle switches -- see refreshNextGroupHighlight(),
+ * which re-sends the overlay for whatever puzzle is current whenever
+ * something might have changed which group is "next", including a
+ * fresh puzzle finishing loading.
+ */
+function toggleNextGroupHighlight() {
+    const puzzleState = Alpine.store("puzzleState");
+
+    if (puzzleState.highlightingNextGroup) {
+        puzzleState.highlightingNextGroup = false;
+        sendMessage("setDigitGroupHighlight", null);
+        return;
+    }
+
+    const entry = Alpine.store("puzzleList").current;
+    if (!entry || !entry.stagePlan) return;
 
     puzzleState.highlightingNextGroup = true;
-    sendMessage("setDigitGroupHighlight", cells, plan.w);
+    refreshNextGroupHighlight(entry);
 }
 
 /**
@@ -1737,6 +1784,11 @@ function syncAPStatus() {
     // logged there and otherwise doesn't affect the rest of this sync.
     if (puzzleList.current && puzzleList.current.stagePlan) {
         liveRevealClues(puzzleList.current);
+        // Likewise, if the currently-open puzzle's highlighted group
+        // just got checked off (or a new item changed which group is
+        // "next"), move the highlight on without making the player
+        // toggle it off and back on -- see refreshNextGroupHighlight().
+        refreshNextGroupHighlight(puzzleList.current);
     }
 
     if (anyNewRemoteSolves) {
