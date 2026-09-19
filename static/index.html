@@ -50,7 +50,7 @@ entry.locked ? 'locked' : 'unlocked', entry.collected ? 'collected' : 'uncollect
                         :disabled="entry.locked && !$store.debugMode">
                             <span x-text="entry.index"></span>.
                             <span x-text="entry.desc"></span>
-                            <template x-if="entry.digitGroupCount !== undefined">
+                            <template x-if="entry.digitGroupCount !== undefined && !entry.locked">
                                 <span x-text="`(${entry.checkedGroupCount}/${entry.availableGroupCount})`"></span>
                             </template>
                         </button>

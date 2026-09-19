@@ -62,13 +62,30 @@ export class GameSave {
         this.puzzleSolved = options.puzzleSolved ?? Array(this.puzzles.length).fill(false)
 
         /**
-         * Locked status of puzzles.
+         * Locked status of puzzles, as last written by syncAPStatus(). Not
+         * actually read back anywhere -- loadFileData() recomputes each
+         * puzzle's locked state fresh every time from startingPuzzleCount
+         * (see there), since that's robust to the YAML's starting_puzzles
+         * option changing between sessions on the same save file, which a
+         * trusted persisted flag wouldn't be. Kept around for save-file
+         * shape compatibility.
          * @type {boolean[]}
          */
-        // No puzzle-level "unlock" item exists in the Progressive Keen item table
-        // (only per-puzzle "Clue Set" items, which gate Digit Groups within an
-        // already-available puzzle) -- default to unlocked.
         this.puzzleLocked = options.puzzleLocked ?? Array(this.puzzles.length).fill(false)
+
+        /**
+         * Number of puzzles (by index, 0-based) accessible from the start,
+         * from the Archipelago world's slot_data (starting_puzzle_count).
+         * Every puzzle at or beyond this count needs its own "Puzzle N" item
+         * received before any of its Digit Group locations are reachable at
+         * all (see loadFileData()/syncAPStatus() in puzzles.js). Defaults to
+         * "every puzzle is a starting puzzle" (nothing locked) for save files
+         * written before this field existed, or while there's no live
+         * connection to refresh it from -- the same fail-open philosophy
+         * already used for a stale digitGroupCounts.
+         * @type {number}
+         */
+        this.startingPuzzleCount = options.startingPuzzleCount ?? this.puzzles.length
 
         /**
          * Target number of clue-group stages ("Digit Group" locations) for
@@ -190,6 +207,7 @@ export class GameSave {
             puzzles: this.puzzles.slice(),
             puzzleSolved: this.puzzleSolved.slice(),
             puzzleLocked: this.puzzleLocked.slice(),
+            startingPuzzleCount: this.startingPuzzleCount,
             digitGroupCounts: this.digitGroupCounts.slice(),
             solveTarget: this.solveTarget
         };

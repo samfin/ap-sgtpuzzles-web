@@ -1597,6 +1597,16 @@ async function checkDigitGroupProgress(entry) {
                     client.check(locationId);
                 }
             }
+
+            // "Puzzle {index} Solved" -- a separate location from every Digit
+            // Group, added purely to give the world extra location capacity
+            // to back "Puzzle N" unlock items (see the AP world's
+            // items.py/rules.py). Same completion condition as the puzzle's
+            // final Digit Group, so it's safe to check here alongside them.
+            const solvedLocationId = locationNameToId(`Puzzle ${entry.index} Solved`);
+            if (solvedLocationId !== undefined && !client.room.checkedLocations.includes(solvedLocationId)) {
+                client.check(solvedLocationId);
+            }
         }
     }
 }
@@ -1763,8 +1773,15 @@ function syncAPStatus() {
         // would mean loading each one into the single shared iframe,
         // which would interrupt whatever puzzle the player currently
         // has open).
+        //
+        // A still-locked puzzle can have received "Clue Set" items
+        // without its "Puzzle N" unlock item (item order isn't
+        // guaranteed), but none of its Digit Group locations are
+        // actually reachable until it's unlocked (see rules.py), so
+        // force both counters to 0 while entry.locked -- using the
+        // value just possibly updated above in this same pass.
         if (entry.digitGroupCount !== undefined) {
-            const availableCount = Math.min(countReceivedClueSets(entry.index), entry.digitGroupCount);
+            const availableCount = entry.locked ? 0 : Math.min(countReceivedClueSets(entry.index), entry.digitGroupCount);
             let checkedCount = 0;
             for (let g = 1; g <= availableCount; g++) {
                 const groupLocationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
@@ -1858,7 +1875,8 @@ async function createFile(hostname, port, player, password) {
         puzzles: slotData.puzzles,
         baseSeed: "" + slotData.world_seed,
         solveTarget: slotData.solve_target,
-        digitGroupCounts: slotData.digit_group_counts
+        digitGroupCounts: slotData.digit_group_counts,
+        startingPuzzleCount: slotData.starting_puzzle_count
     });
 
     await clearPuzzle();
@@ -1944,14 +1962,18 @@ async function loadFile(file, secretMode, newConnection) {
     }
 
     if (connectOk) {
-        // Refresh digitGroupCounts from the server on every successful
-        // (re)connect, not just brand-new files: a file saved before this
-        // field existed (or before the world's digit_group_count option
-        // was what it is now) would otherwise be stuck with GameSave's
-        // Array(...).fill(1) default forever, which looks exactly like
-        // "every puzzle shows fully revealed" -- because with N=1, a
-        // single-stage division genuinely *is* full reveal.
+        // Refresh digitGroupCounts (and startingPuzzleCount) from the
+        // server on every successful (re)connect, not just brand-new files:
+        // a file saved before these fields existed (or before the world's
+        // options were what they are now) would otherwise be stuck with
+        // GameSave's fail-open defaults forever -- digitGroupCounts's
+        // Array(...).fill(1) looks exactly like "every puzzle shows fully
+        // revealed" (with N=1, a single-stage division genuinely *is* full
+        // reveal), and a stale startingPuzzleCount could leave a
+        // now-later-unlocked puzzle looking permanently accessible, or vice
+        // versa.
         file.digitGroupCounts = slotData.digit_group_counts;
+        file.startingPuzzleCount = slotData.starting_puzzle_count;
     }
 
     if (newConnection && connectOk) {
@@ -2338,15 +2360,19 @@ function loadFileData(file, secretMode) {
     puzzleList.sortBySolved = !isFreeplay;
 
     for (let i = 0; i < file.puzzles.length; i++) {
-        // NOTE: Progressive Keen has no per-puzzle "unlock" item -- every puzzle is
-        // available to attempt from the start; only individual Digit Groups
-        // within a puzzle are gated by "Puzzle {i+1} Clue Set" items. So we
-        // deliberately ignore file.puzzleLocked here rather than reading a
-        // lock state that has no basis in the real item table (see also
-        // syncAPStatus() below, which has the same legacy assumption baked
-        // into its item/location name lookups).
+        // A puzzle at or beyond startingPuzzleCount needs its own "Puzzle N"
+        // item before it's accessible at all -- assume locked here purely
+        // from that structural fact (freeplay puzzles are never gated) and
+        // deliberately don't consult hasItem()/client.items.received yet:
+        // this runs before the connection is guaranteed fully settled, but
+        // syncAPStatus() is always called again immediately after loadFileData()
+        // on every connect path, and it will flip this back to false the moment
+        // it sees the item already received, so an initial over-lock here is
+        // only ever momentary. We deliberately ignore file.puzzleLocked, which
+        // is stale by construction if starting_puzzles changed since this file
+        // was last saved (see its comment in savedata.js).
         let options = {
-            locked: false,
+            locked: !isFreeplay && (i + 1) > file.startingPuzzleCount,
             solved: file.puzzleSolved[i],
             digitGroupCount: isFreeplay ? undefined : file.digitGroupCounts[i],
         }
