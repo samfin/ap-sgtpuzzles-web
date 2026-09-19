@@ -1013,6 +1013,11 @@ function initPuzzle() {
      */
     if (containing_div !== null) {
         var resize_handler = function(event) {
+            console.log("[resize-debug] resize_handler fired at " +
+                performance.now().toFixed(1) + "ms, event=" + event.type +
+                ", containing_div=" + containing_div.clientWidth + "x" +
+                containing_div.clientHeight + ", resizeW/H=" + resizeW +
+                "/" + resizeH);
             rescale_puzzle();
         }
         window.addEventListener("resize", resize_handler);
@@ -1080,15 +1085,20 @@ function post_init() {
     // than oscillating, so it's not worth the risk to additionally
     // guard against a browser-window-resize scenario nobody has
     // actually reported.
-    function reapplyPersistedResize() {
+    function reapplyPersistedResize(tag) {
+        console.log("[resize-debug] reapplyPersistedResize(" + tag +
+            ") at " + performance.now().toFixed(1) + "ms, resizeW/H=" +
+            resizeW + "/" + resizeH);
         if (typeof resize_puzzle === "function" &&
             resizeW !== null && resizeH !== null) {
             resize_puzzle(resizeW, resizeH);
         }
     }
-    reapplyPersistedResize();
+    reapplyPersistedResize("immediate");
     if (resizeW !== null && resizeH !== null) {
-        window.addEventListener("load", reapplyPersistedResize);
+        window.addEventListener("load", function(event) {
+            reapplyPersistedResize("load-listener");
+        });
     }
 
     // If we get here with everything having gone smoothly, i.e.
