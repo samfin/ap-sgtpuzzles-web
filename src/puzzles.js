@@ -1545,6 +1545,16 @@ function toggleNextGroupHighlight() {
  * already correctly filled in before this feature existed the moment
  * it's reopened (post_move() fires once right after the initial load
  * too, not just after player input).
+ *
+ * Also autosaves (savePuzzleData()) the instant any Digit Group location
+ * actually gets newly checked here -- previously the only autosave was
+ * on a full puzzle solve (markSolved()'s call, triggered by the engine's
+ * own "solved" status), so progress on an individual digit group could
+ * sit unsaved indefinitely until the player remembered to hit the manual
+ * "Save puzzle progress" button or fully solved the puzzle. `entry` here
+ * is always whatever's current (the only caller passes
+ * Alpine.store("puzzleList").current), so this never saves the wrong
+ * puzzle's progress under the current one's name.
  */
 async function checkDigitGroupProgress(entry) {
     if (!isApReady()) return;
@@ -1556,6 +1566,8 @@ async function checkDigitGroupProgress(entry) {
 
     const currentGrid = await getCurrentGrid();
     if (!currentGrid) return;
+
+    let newlyChecked = false;
 
     // Digit Groups 1..unlockedCount are each individually checkable now
     // (rules.py's access rule), whether or not this client's own
@@ -1571,6 +1583,7 @@ async function checkDigitGroupProgress(entry) {
         const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${groupNumber}`);
         if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
             client.check(locationId);
+            newlyChecked = true;
         }
     }
 
@@ -1595,6 +1608,7 @@ async function checkDigitGroupProgress(entry) {
                 const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${groupNumber}`);
                 if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
                     client.check(locationId);
+                    newlyChecked = true;
                 }
             }
 
@@ -1606,8 +1620,13 @@ async function checkDigitGroupProgress(entry) {
             const solvedLocationId = locationNameToId(`Puzzle ${entry.index} Solved`);
             if (solvedLocationId !== undefined && !client.room.checkedLocations.includes(solvedLocationId)) {
                 client.check(solvedLocationId);
+                newlyChecked = true;
             }
         }
+    }
+
+    if (newlyChecked) {
+        savePuzzleData();
     }
 }
 
