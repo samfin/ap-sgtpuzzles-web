@@ -240,6 +240,25 @@ function revealClues(desc) {
     sendMessage("revealCluesCallback", err || null);
 }
 
+// Apply an arbitrary move string to the live, currently-displayed
+// puzzle as a normal, undoable move -- see apply_move()/
+// midend_apply_move()'s doc comments (emcc-ap.c/midend.c) for the full
+// contract. Used by the "double-right-click a clued cage to pencil in
+// candidates" feature: handleCellDoubleRightClicked() in
+// src/puzzles.js computes the move string (an "F..." bulk pencil-set
+// move -- see execute_move() in keen.c) and just needs somewhere to
+// hand it in.
+function applyMove(movestr) {
+    if (typeof apply_move !== "function") {
+        // Current genre doesn't implement this move type (e.g. not Keen).
+        sendMessage("applyMoveCallback", "Not supported for this game");
+        return;
+    }
+
+    var err = apply_move(movestr); // defined in {genre}.js; a 'string' cwrap, no pointer to free
+    sendMessage("applyMoveCallback", err || null);
+}
+
 // Show or clear the "highlight next digit group" overlay (see
 // toggleNextGroupHighlight() in src/puzzles.js, which computes which
 // cells to highlight -- this function only knows how to draw them).
@@ -281,7 +300,8 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData,
-    getForcedDigits, setDigitGroupHighlight, getCurrentGrid, revealClues
+    getForcedDigits, setDigitGroupHighlight, getCurrentGrid, revealClues,
+    applyMove
 }
 
 function processMessage(message) {

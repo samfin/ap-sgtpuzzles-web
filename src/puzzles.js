@@ -9,7 +9,7 @@ const SaveData = require("./savedata.js");
 const {GameSave, getFile, getFileList, openDatabase} = SaveData;
 const {config} = require("config")
 const {genres, genreInfo} = require("./genres.js")
-const {parseKeenDescriptor, buildMaskedDescriptor, touchingCagesByLine, rowColStartCandidates, allLines, seededShuffleCopy, countForcedDigits, mergeNoProgressStages} = require("./keenDivision.js")
+const {parseKeenDescriptor, buildMaskedDescriptor, touchingCagesByLine, rowColStartCandidates, allLines, seededShuffleCopy, countForcedDigits, mergeNoProgressStages, cageCandidateDigits} = require("./keenDivision.js")
 
 document.addEventListener("alpine:init", onInit)
 
@@ -93,7 +93,7 @@ class ArchipelagoPuzzle {
 
         // Sidebar "(checked/available)" counter: how many of this
         // puzzle's Digit Group locations are checked, and how many are
-        // currently reachable at all (checked or not) given "Clue Set"
+        // currently reachable at all (checked or not) given "Clue"
         // items received so far -- e.g. (5/8) for a puzzle with 5
         // solved groups and 3 more already unlocked but not yet filled
         // in. Recomputed alongside hasProgressAvailable in
@@ -571,7 +571,7 @@ function resetPuzzleMetadata() {
 }
 
 /**
- * Number of "Puzzle {index} Clue Set" items received so far for a given
+ * Number of "Puzzle {index} Clue" items received so far for a given
  * puzzle -- i.e. how many clue groups are unlocked for that puzzle. Per
  * rules.py, Digit Group 1 itself requires >= 1 copy, so 0 items means 0
  * clue groups visible (a fully masked puzzle), not "clue group 1 for
@@ -580,7 +580,7 @@ function resetPuzzleMetadata() {
  */
 function countReceivedClueSets(index) {
     if (!isApReady()) return 0;
-    const itemId = itemNameToId(`Puzzle ${index} Clue Set`);
+    const itemId = itemNameToId(`Puzzle ${index} Clue`);
     if (itemId === undefined) return 0;
     return client.items.received.filter(e => e.id === itemId).length;
 }
@@ -776,7 +776,7 @@ async function chooseNextStageReveal(parsed, paramsStr, visible, cagesForLine, p
  * first, falling back to individual cages), except the very last stage
  * the world's digit_group_count allows, which always takes every still-
  * hidden cage at once regardless of what a smaller reveal would do --
- * this is what guarantees a player holding every Clue Set item for a
+ * this is what guarantees a player holding every Clue item for a
  * puzzle always sees the complete thing, not a partially-clued dead
  * end. mergeNoProgressStages() is still run as a final defensive pass,
  * though by construction every non-final stage here should already
@@ -829,7 +829,7 @@ async function resolveKeenStagePlan(entry, gameId) {
             // The last stage the world's digit_group_count allows must be
             // the complete puzzle regardless of what a smaller reveal
             // would do -- take every still-hidden cage at once,
-            // guaranteeing a player holding every Clue Set item for this
+            // guaranteeing a player holding every Clue item for this
             // puzzle always sees the complete thing (see the doc comment
             // on chooseNextStageReveal() above for why this can't be
             // left to the general search).
@@ -882,12 +882,12 @@ function keenVisibleId(entry) {
  * new clues have actually arrived since it was last loaded/reveal.
  * Two callers:
  *   - syncAPStatus() (see onReceiveItems()), so an already-open puzzle
- *     updates live the moment a new "Clue Set" item comes in, instead
+ *     updates live the moment a new "Clue" item comes in, instead
  *     of requiring the player to back out to the list and reselect
  *     the puzzle to see it (the previous behavior).
  *   - loadPuzzleData(), right after restoring a manual "Save puzzle
  *     progress" save, to catch up a puzzle that was saved (and thus
- *     had fewer clues visible) before more Clue Set items were
+ *     had fewer clues visible) before more Clue items were
  *     unlocked for it elsewhere -- otherwise the just-restored midend
  *     would be stuck showing only whatever was visible at save time
  *     forever, since loadPuzzle() deliberately never sends a fresh
@@ -1302,6 +1302,115 @@ function revealClues(desc) {
     });
 }
 
+// Same one-request-at-a-time pattern again, for applying an arbitrary
+// move string to the live, currently-loaded puzzle as a normal,
+// undoable move (see applyMove() in static/puzzleframe.js). Resolves
+// to null on success, or an error string on failure. Used by
+// handleCellDoubleRightClicked() below.
+let pendingApplyMoveResolve = null;
+
+function applyMoveCallback(result) {
+    if (pendingApplyMoveResolve) {
+        let resolve = pendingApplyMoveResolve;
+        pendingApplyMoveResolve = null;
+        resolve(result);
+    }
+}
+
+function applyMove(movestr) {
+    return new Promise((resolve) => {
+        pendingApplyMoveResolve = resolve;
+        sendMessage("applyMove", movestr);
+    });
+}
+
+/**
+ * Feature: double-right-click a cell in a CLUED cage to pencil in that
+ * cage's candidates, considered in isolation from the rest of the
+ * board (user's request) -- see cageCandidateDigits() in
+ * keenDivision.js for the actual isolated-cage combinatorics (which
+ * digits could appear in the cage's still-empty cells at all, given
+ * only its own arithmetic clue and whatever's already filled into its
+ * OTHER cells). This function's own job is everything cageCandidateDigits()
+ * deliberately doesn't do: find which cage got double-right-clicked,
+ * confirm its clue is actually visible right now (never leak
+ * information about a still-masked cage), read the live grid, apply
+ * ordinary per-cell row/column ("sees") elimination on top of the
+ * isolated candidates, and hand the result to the native side as one
+ * atomic, undoable move.
+ *
+ * `tx`,`ty` come from emccpre-ap.js's own double-right-click detection
+ * (see cellFromCanvasXY() there) -- it only knows raw column/row, not
+ * the grid width, so bounds-checking against `w` happens here.
+ */
+async function handleCellDoubleRightClicked(tx, ty) {
+    const entry = Alpine.store("puzzleList").current;
+    const plan = entry && entry.stagePlan;
+    if (!plan) return;
+
+    const w = plan.w;
+    if (tx < 0 || tx >= w || ty < 0 || ty >= w) return;
+    const cellIndex = ty * w + tx;
+
+    const cageId = plan.parsed.cageIdOfCell[cellIndex];
+    const cage = plan.parsed.cages.get(cageId);
+    if (!cage) return;
+
+    // "The cage must have a known clue for this to work" -- don't let
+    // double-right-clicking a still-masked cage give away anything
+    // about it. This checks the SAME notion of "currently visible"
+    // that the rest of the client uses (entry.displayedClueCount's
+    // stage, not merely "achieved" or "resolvable"), so it always
+    // matches what's actually on screen.
+    const stageIndex = Math.min(entry.displayedClueCount || 0, plan.achieved) - 1;
+    const visibleCageIds = stageIndex >= 0 ? plan.stages[stageIndex].cageIds : new Set();
+    if (!visibleCageIds.has(cageId)) return;
+
+    const op = cage.token[0];
+    const value = parseInt(cage.token.slice(1), 10);
+    if (!Number.isFinite(value)) return;
+
+    const currentGrid = await getCurrentGrid();
+    if (!currentGrid) return;
+
+    const result = cageCandidateDigits(w, cage.cells, op, value, currentGrid);
+    if (!result) return;
+
+    // Per-cell row/column elimination ("sees"), applied independently
+    // to each empty cell -- deliberately the ONLY thing this adds on
+    // top of the isolated-cage candidates: if a cell sees a digit
+    // elsewhere in its own row/column, that digit is excluded from
+    // THAT cell only, never inferred onto any other cell in the cage
+    // (see cageCandidateDigits()'s doc comment for the same "don't be
+    // smart" principle applied to the cage-arithmetic side).
+    const moveParts = [];
+    for (const cell of result.emptyCells) {
+        const row = Math.floor(cell / w);
+        const col = cell % w;
+        const seen = new Set();
+        for (let c = 0; c < w; c++) {
+            const ch = currentGrid[row * w + c];
+            if (c !== col && ch !== '0') seen.add(ch.charCodeAt(0) - '0'.charCodeAt(0));
+        }
+        for (let r = 0; r < w; r++) {
+            const ch = currentGrid[r * w + col];
+            if (r !== row && ch !== '0') seen.add(ch.charCodeAt(0) - '0'.charCodeAt(0));
+        }
+
+        let bitmask = 0;
+        for (const d of result.candidates) {
+            if (!seen.has(d)) bitmask |= (1 << d);
+        }
+        moveParts.push(`${col},${row},${bitmask}`);
+    }
+    if (moveParts.length === 0) return;
+
+    const err = await applyMove(`F${moveParts.join(';')}`);
+    if (err) {
+        console.warn("Failed to apply cage-candidate-fill move:", err);
+    }
+}
+
 const messageHandlers = {
     ready: onPuzzleFrameLoad, js_init_puzzle, js_post_init,
     js_update_permalinks, js_enable_undo_redo, js_remove_solve_button, js_update_status, js_update_key_labels,
@@ -1309,7 +1418,8 @@ const messageHandlers = {
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
     savePuzzleDataCallback, getForcedDigitsCallback, getCurrentGridCallback,
-    revealCluesCallback, loadPuzzleDataCallback, restartPuzzleCallback, puzzleResized
+    revealCluesCallback, loadPuzzleDataCallback, restartPuzzleCallback, puzzleResized,
+    applyMoveCallback, cellDoubleRightClicked: handleCellDoubleRightClicked
 }
 
 function processMessage(message) {
@@ -1441,7 +1551,7 @@ function digitGroupCells(plan, groupNumber) {
 // "The next digit group" is the earliest unlocked group the player
 // hasn't actually solved (checked) yet -- NOT necessarily the
 // highest-numbered unlocked group. Items and solving progress are
-// independent: nothing stops several "Clue Set" items for a puzzle
+// independent: nothing stops several "Clue" items for a puzzle
 // from arriving before the player has caught up on solving the
 // earlier groups they unlocked, so `unlockedCount` alone (how many
 // items have been received) can overshoot how far the player has
@@ -1691,7 +1801,7 @@ async function loadPuzzleData() {
         });
 
         // Bug: a save captures whatever clues were visible *at save
-        // time*. If the player since unlocked more "Clue Set" items
+        // time*. If the player since unlocked more "Clue" items
         // for this puzzle elsewhere and comes back, loadPuzzle() (see
         // loadKeenAwarePuzzleEntry) deliberately skips sending the
         // freshly-computed visible id whenever a save exists, so the
@@ -1783,7 +1893,7 @@ function syncAPStatus() {
 
         // Sidebar highlight: does this puzzle have an unlocked Digit
         // Group the player hasn't finished yet? Deliberately keyed
-        // purely off item/location state (how many "Clue Set" items
+        // purely off item/location state (how many "Clue" items
         // have been received, and which "Puzzle N Digit Group G"
         // locations are already checked) rather than this entry's own
         // stagePlan, so it works for every puzzle in the list right
@@ -1793,7 +1903,7 @@ function syncAPStatus() {
         // which would interrupt whatever puzzle the player currently
         // has open).
         //
-        // A still-locked puzzle can have received "Clue Set" items
+        // A still-locked puzzle can have received "Clue" items
         // without its "Puzzle N" unlock item (item order isn't
         // guaranteed), but none of its Digit Group locations are
         // actually reachable until it's unlocked (see rules.py), so
@@ -1826,7 +1936,7 @@ function syncAPStatus() {
 
     // If the puzzle currently open in the frame is a progressive Keen
     // puzzle and this sync was triggered by (among other things) a
-    // newly-received "Clue Set" item, reveal it live rather than
+    // newly-received "Clue" item, reveal it live rather than
     // waiting for the player to back out and reselect the puzzle --
     // see liveRevealClues() above. Fire-and-forget: any failure is
     // logged there and otherwise doesn't affect the rest of this sync.

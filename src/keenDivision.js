@@ -447,6 +447,121 @@ function mergeNoProgressStages(stages, forcedCounts) {
     return kept;
 }
 
+/**
+ * All digit values (1..w) that could occupy at least one of a clued
+ * cage's still-empty cells, considering ONLY that cage's own
+ * arithmetic clue -- deliberately ignoring the rest of the board's
+ * row/column ("Latin square") constraints entirely, and consistent
+ * with whatever digits are already filled into the cage's OTHER
+ * cells. Row/column elimination for a specific cell is the caller's
+ * job (see handleCellDoubleRightClicked() in puzzles.js) -- this
+ * function only ever reasons about the cage in isolation, per the
+ * feature's design (double-right-click a clued cage to pencil in its
+ * candidates, without being "smart" about anything outside the cage).
+ *
+ * Cage cells are not distinguished by position: addition/
+ * multiplication (any cage size) and subtraction/division (always
+ * exactly 2 cells, per Keen's own generator -- never any other size)
+ * are all order-independent, so any permutation of a valid multiset
+ * across the cage's cells is an equally valid assignment. That means
+ * every still-empty cell gets the exact same raw candidate set here --
+ * this deliberately does NOT try to narrow one cell's candidates
+ * because of what a valid assignment left over for another (e.g. a
+ * 2-cell 6x cage with candidates {1,6}/{2,3} always offers "1236" to
+ * BOTH empty cells, never inferring "well, if this one's excluded from
+ * 1 it must be 6, so exclude 2 and 3 from the other" -- see
+ * progress-notes.md for the worked examples this mirrors verbatim).
+ *
+ * `currentGrid` is a w*w-length digit string, '0' for an empty cell,
+ * indexed the same way as cageCells (row*w+col) -- see getCurrentGrid()
+ * in puzzles.js. `op`/`value` come straight from the cage's own
+ * (always-unmasked) parsed clue token -- see parseKeenDescriptor()
+ * above: op is one of 'a' (add), 'm' (multiply), 's' (subtract),
+ * 'd' (divide); 'n' (no clue) should never reach here, since the
+ * caller only calls this once it's confirmed the cage's clue is
+ * actually visible right now.
+ *
+ * Returns null if the cage is already fully filled (nothing to
+ * compute) or if op/n don't admit any valid assignment at all
+ * (shouldn't happen for a puzzle that's still solvable, but this
+ * fails safe rather than throwing). Otherwise returns
+ * { candidates: Set<number>, emptyCells: number[] }.
+ */
+function cageCandidateDigits(w, cageCells, op, value, currentGrid) {
+    const filledCounts = new Map();
+    const emptyCells = [];
+    for (const cell of cageCells) {
+        const ch = currentGrid ? currentGrid[cell] : '0';
+        if (ch && ch !== '0') {
+            const d = ch.charCodeAt(0) - '0'.charCodeAt(0);
+            filledCounts.set(d, (filledCounts.get(d) || 0) + 1);
+        } else {
+            emptyCells.push(cell);
+        }
+    }
+    if (emptyCells.length === 0) return null;
+
+    const n = cageCells.length;
+    if ((op === 's' || op === 'd') && n !== 2) return null;
+
+    const satisfiesClue = (multiset) => {
+        if (op === 'a') return multiset.reduce((a, b) => a + b, 0) === value;
+        if (op === 'm') return multiset.reduce((a, b) => a * b, 1) === value;
+        if (op === 's') return Math.abs(multiset[0] - multiset[1]) === value;
+        if (op === 'd') {
+            const hi = Math.max(multiset[0], multiset[1]);
+            const lo = Math.min(multiset[0], multiset[1]);
+            return lo !== 0 && hi % lo === 0 && hi / lo === value;
+        }
+        return false;
+    };
+
+    const countsOf = (multiset) => {
+        const counts = new Map();
+        for (const v of multiset) counts.set(v, (counts.get(v) || 0) + 1);
+        return counts;
+    };
+
+    // A multiset is only usable if it has enough of each digit already
+    // filled into one of the cage's OTHER cells -- e.g. a cage with one
+    // cell already holding a 5 can't be satisfied by a multiset with no
+    // 5 in it at all.
+    const admitsFilled = (counts) => {
+        for (const [d, c] of filledCounts) {
+            if ((counts.get(d) || 0) < c) return false;
+        }
+        return true;
+    };
+
+    const candidates = new Set();
+    const current = [];
+
+    // Every non-decreasing (i.e. unordered/multiset) sequence of length
+    // n from 1..w -- cheap at Keen's cage/grid sizes (at most
+    // C(w+n-1, n), comfortably under a thousand even at w=9).
+    const recurse = (start) => {
+        if (current.length === n) {
+            if (!satisfiesClue(current)) return;
+            const counts = countsOf(current);
+            if (!admitsFilled(counts)) return;
+            for (const [d, c] of filledCounts) counts.set(d, (counts.get(d) || 0) - c);
+            for (const [d, remaining] of counts) {
+                if (remaining > 0) candidates.add(d);
+            }
+            return;
+        }
+        for (let d = start; d <= w; d++) {
+            current.push(d);
+            recurse(d);
+            current.pop();
+        }
+    };
+    recurse(1);
+
+    if (candidates.size === 0) return null;
+    return { candidates, emptyCells };
+}
+
 module.exports = {
     parseKeenDescriptor,
     buildMaskedDescriptor,
@@ -460,6 +575,7 @@ module.exports = {
     seededShuffleCopy,
     countForcedDigits,
     mergeNoProgressStages,
+    cageCandidateDigits,
     _hashStringToSeed: hashStringToSeed,
     _mulberry32: mulberry32,
 };

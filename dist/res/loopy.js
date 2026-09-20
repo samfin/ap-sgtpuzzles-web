@@ -259,6 +259,7 @@ var load_game
 var solve_partial_desc, free_solve_partial
 var get_current_grid, free_current_grid
 var reveal_clues
+var apply_move
 var resize_puzzle, restore_puzzle_size
 
 // The <form> encapsulating the menus.  Used by
@@ -451,13 +452,44 @@ function initPuzzle() {
                                  ['number', 'number', 'number']);
     var mouseup = Module.cwrap('mouseup', 'boolean',
                                ['number', 'number', 'number']);
-    
+    var get_tilesize = Module.cwrap('get_tilesize', 'number', []);
+
     var touchEmulationDown = false;
     var touchEmulationActive = false;
     var touchEmulationButton = 0;
     var touchEmulationStartPos = {x: 0, y: 0};
     var touchEmulationStartScreenPos = {x: 0, y: 0};
     const touchEmulationDragThreshold = 10;
+
+    // Double-right-click-on-a-cage detection, for the "pencil in this
+    // cage's in-isolation candidates" feature (see
+    // handleCellDoubleRightClicked() in src/puzzles.js, which does all
+    // the actual cage/arithmetic reasoning once notified). This only
+    // needs to know WHICH CELL got clicked twice in a row within a
+    // short window -- everything else about the feature lives in the
+    // parent frame. Deliberately independent of the native
+    // mousedown()/interpret_move() call below (which still runs
+    // exactly as before, e.g. still moving the normal pencil-mode
+    // highlight): this is a pure JS-side observer bolted on top, not a
+    // replacement for anything.
+    //
+    // tx/ty are derived with the same FROMCOORD() arithmetic keen.c's
+    // own interpret_move() uses (see keen.c), using get_tilesize()
+    // (-> midend_tilesize()) so this needs no game-specific constant
+    // and stays correct across zoom/resize/device-pixel-ratio -- only
+    // the grid width bound-check (which this can't do without knowing
+    // w) is left to the parent, which already knows it.
+    var lastRightClickCell = null;
+    const doubleRightClickThresholdMs = 500;
+
+    function cellFromCanvasXY(x, y) {
+        var ts = get_tilesize();
+        if (!ts) return null;
+        var border = Math.floor(ts / 2);
+        var tx = Math.floor((Math.trunc(x) + (ts - border)) / ts) - 1;
+        var ty = Math.floor((Math.trunc(y) + (ts - border)) / ts) - 1;
+        return {tx: tx, ty: ty};
+    }
 
     var button_phys2log = [null, null, null];
     var buttons_down = function() {
@@ -501,6 +533,20 @@ function initPuzzle() {
             if (mousedown(xy.x, xy.y, logbutton))
                 event.preventDefault();
             button_phys2log[event.button] = logbutton;
+
+            if (logbutton == 2) {
+                var cell = cellFromCanvasXY(xy.x, xy.y);
+                var now = Date.now();
+                if (cell && lastRightClickCell &&
+                    lastRightClickCell.tx == cell.tx &&
+                    lastRightClickCell.ty == cell.ty &&
+                    now - lastRightClickCell.time < doubleRightClickThresholdMs) {
+                    lastRightClickCell = null;
+                    sendMessage("cellDoubleRightClicked", cell.tx, cell.ty);
+                } else {
+                    lastRightClickCell = cell ? {tx: cell.tx, ty: cell.ty, time: now} : null;
+                }
+            }
         }
     };
     onscreen_canvas.onpointermove = function (event) {
@@ -643,6 +689,7 @@ function initPuzzle() {
                                       ['number']);
 
     reveal_clues = Module.cwrap('reveal_clues', 'string', ['string']);
+    apply_move = Module.cwrap('apply_move', 'string', ['string']);
 
     if (save_button) save_button.onclick = function(event) {
         if (dlg_dimmer === null) {
@@ -3332,6 +3379,8 @@ var _free_solve_partial = Module['_free_solve_partial'] = makeInvalidEarlyAccess
 var _get_current_grid = Module['_get_current_grid'] = makeInvalidEarlyAccess('_get_current_grid');
 var _free_current_grid = Module['_free_current_grid'] = makeInvalidEarlyAccess('_free_current_grid');
 var _reveal_clues = Module['_reveal_clues'] = makeInvalidEarlyAccess('_reveal_clues');
+var _apply_move = Module['_apply_move'] = makeInvalidEarlyAccess('_apply_move');
+var _get_tilesize = Module['_get_tilesize'] = makeInvalidEarlyAccess('_get_tilesize');
 var _get_save_file = Module['_get_save_file'] = makeInvalidEarlyAccess('_get_save_file');
 var _free_save_file = Module['_free_save_file'] = makeInvalidEarlyAccess('_free_save_file');
 var _load_game = Module['_load_game'] = makeInvalidEarlyAccess('_load_game');
@@ -3372,6 +3421,8 @@ function assignWasmExports(wasmExports) {
   assert(typeof wasmExports['get_current_grid'] != 'undefined', 'missing Wasm export: get_current_grid');
   assert(typeof wasmExports['free_current_grid'] != 'undefined', 'missing Wasm export: free_current_grid');
   assert(typeof wasmExports['reveal_clues'] != 'undefined', 'missing Wasm export: reveal_clues');
+  assert(typeof wasmExports['apply_move'] != 'undefined', 'missing Wasm export: apply_move');
+  assert(typeof wasmExports['get_tilesize'] != 'undefined', 'missing Wasm export: get_tilesize');
   assert(typeof wasmExports['get_save_file'] != 'undefined', 'missing Wasm export: get_save_file');
   assert(typeof wasmExports['free_save_file'] != 'undefined', 'missing Wasm export: free_save_file');
   assert(typeof wasmExports['load_game'] != 'undefined', 'missing Wasm export: load_game');
@@ -3409,6 +3460,8 @@ function assignWasmExports(wasmExports) {
   _get_current_grid = Module['_get_current_grid'] = createExportWrapper('get_current_grid', wasmExports['get_current_grid'], 0);
   _free_current_grid = Module['_free_current_grid'] = createExportWrapper('free_current_grid', wasmExports['free_current_grid'], 1);
   _reveal_clues = Module['_reveal_clues'] = createExportWrapper('reveal_clues', wasmExports['reveal_clues'], 1);
+  _apply_move = Module['_apply_move'] = createExportWrapper('apply_move', wasmExports['apply_move'], 1);
+  _get_tilesize = Module['_get_tilesize'] = createExportWrapper('get_tilesize', wasmExports['get_tilesize'], 0);
   _get_save_file = Module['_get_save_file'] = createExportWrapper('get_save_file', wasmExports['get_save_file'], 0);
   _free_save_file = Module['_free_save_file'] = createExportWrapper('free_save_file', wasmExports['free_save_file'], 1);
   _load_game = Module['_load_game'] = createExportWrapper('load_game', wasmExports['load_game'], 0);
