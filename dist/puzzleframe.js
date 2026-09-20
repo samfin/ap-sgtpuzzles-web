@@ -220,6 +220,26 @@ function getCurrentGrid() {
     sendMessage("getCurrentGridCallback", result);
 }
 
+// Same as getCurrentGrid() above, but for the live, currently-
+// displayed puzzle's PENCIL marks -- a comma-separated string of
+// decimal bitmasks, one per cell (see keen_current_pencil() in
+// keen.c). Used by the "double-right-click a clued cage" feature in
+// src/puzzles.js to tell whether the double-right-clicked cell
+// already has any pencil marks in it before overwriting them.
+function getCurrentPencil() {
+    if (typeof get_current_pencil !== "function") {
+        // Current genre doesn't implement current_pencil (e.g. not Keen).
+        sendMessage("getCurrentPencilCallback", null);
+        return;
+    }
+
+    var ptr = get_current_pencil(); // defined in {genre}.js
+    var result = ptr ? UTF8ToString(ptr) : null;
+    if (ptr) free_current_pencil(ptr);
+
+    sendMessage("getCurrentPencilCallback", result);
+}
+
 // Push newly-unlocked clues into the live, currently-loaded puzzle in
 // place, without reloading the frame -- see reveal_clues()'s doc
 // comment (emcc-ap.c/puzzles.h/keen.c) for the full contract. `desc`
@@ -300,8 +320,8 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData,
-    getForcedDigits, setDigitGroupHighlight, getCurrentGrid, revealClues,
-    applyMove
+    getForcedDigits, setDigitGroupHighlight, getCurrentGrid, getCurrentPencil,
+    revealClues, applyMove
 }
 
 function processMessage(message) {

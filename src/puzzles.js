@@ -1294,6 +1294,29 @@ function getCurrentGrid() {
     });
 }
 
+// Same one-request-at-a-time pattern again, for reading the live,
+// currently-displayed puzzle's PENCIL marks -- a comma-separated
+// string of decimal bitmasks, one per cell, same convention as the
+// 'P'/'F' moves (see getCurrentPencil() in static/puzzleframe.js).
+// Used by handleCellDoubleRightClicked() below to tell whether the
+// double-right-clicked cell already has any pencil marks in it.
+let pendingCurrentPencilResolve = null;
+
+function getCurrentPencilCallback(result) {
+    if (pendingCurrentPencilResolve) {
+        let resolve = pendingCurrentPencilResolve;
+        pendingCurrentPencilResolve = null;
+        resolve(result);
+    }
+}
+
+function getCurrentPencil() {
+    return new Promise((resolve) => {
+        pendingCurrentPencilResolve = resolve;
+        sendMessage("getCurrentPencil");
+    });
+}
+
 // Same one-request-at-a-time pattern again, for pushing newly-unlocked
 // clues into the live, currently-loaded puzzle in place (see
 // revealClues() in static/puzzleframe.js). Resolves to null on
@@ -1339,19 +1362,47 @@ function applyMove(movestr) {
 }
 
 /**
- * Feature: double-right-click a cell in a CLUED cage to pencil in that
- * cage's candidates, considered in isolation from the rest of the
- * board (user's request) -- see cageCandidateDigits() in
- * keenDivision.js for the actual isolated-cage combinatorics (which
- * digits could appear in the cage's still-empty cells at all, given
- * only its own arithmetic clue and whatever's already filled into its
- * OTHER cells). This function's own job is everything cageCandidateDigits()
- * deliberately doesn't do: find which cage got double-right-clicked,
- * confirm its clue is actually visible right now (never leak
- * information about a still-masked cage), read the live grid, apply
- * ordinary per-cell row/column ("sees") elimination on top of the
- * isolated candidates, and hand the result to the native side as one
- * atomic, undoable move.
+ * Feature: double-right-click an empty cell to pencil in candidates
+ * for it (user's request), in one of two modes depending on whether
+ * the cell's cage currently has a visible clue:
+ *
+ *   - CLUED cage: pencils in candidates for every still-empty cell in
+ *     the WHOLE cage, computed "in isolation" from the rest of the
+ *     board -- see cageCandidateDigits() in keenDivision.js for the
+ *     actual isolated-cage combinatorics (which digits could appear
+ *     in the cage's still-empty cells at all, given only its own
+ *     arithmetic clue and whatever's already filled into its OTHER
+ *     cells). Filling the whole cage at once is safe precisely because
+ *     a clued cage's cells all share one known joint constraint (the
+ *     clue) -- there's nothing extra being revealed beyond what that
+ *     clue's own arithmetic already implies.
+ *   - UNCLUED (still-masked) cage: there's no cage arithmetic to
+ *     reason with at all, so this can't be "in isolation" the way a
+ *     clued cage's fill is, and per the user's explicit direction,
+ *     "no information about that cage should be used" -- only ordinary
+ *     row/column ("sees") elimination applies, and only to digits
+ *     1..w. This also means it would be wrong to propagate a fill to
+ *     the cage's OTHER cells the way the clued case does (they share
+ *     no known joint constraint at all), so this mode fills ONLY the
+ *     single cell that was actually double-right-clicked.
+ *
+ * Either way, ordinary per-cell row/column elimination is applied on
+ * top: a digit already filled in elsewhere in a given cell's own row
+ * or column is excluded from THAT cell only, independently -- never
+ * inferred onto any other cell (see cageCandidateDigits()'s doc
+ * comment for the same "don't be smart" principle on the cage side).
+ *
+ * The double-right-clicked cell itself must be completely blank --
+ * no real digit filled in, AND no pencil marks already present,
+ * whether from an earlier double-right-click or the player's own
+ * manual 'P' toggles -- or nothing happens at all. Since the 'F' move
+ * this builds REPLACES (not merges) a cell's pencil marks, overwriting
+ * an already-annotated cell would blow away work the player already
+ * did, which is exactly the annoyance the user asked to avoid; a
+ * genuinely blank cell has nothing to lose. (For the clued-cage case,
+ * this check only applies to the clicked cell -- the rest of that
+ * cage's still-empty cells are filled/overwritten as before, since
+ * they're all part of the one deliberate whole-cage reveal.)
  *
  * `tx`,`ty` come from emccpre-ap.js's own double-right-click detection
  * (see cellFromCanvasXY() there) -- it only knows raw column/row, not
@@ -1370,35 +1421,31 @@ async function handleCellDoubleRightClicked(tx, ty) {
     const cage = plan.parsed.cages.get(cageId);
     if (!cage) return;
 
-    // "The cage must have a known clue for this to work" -- don't let
-    // double-right-clicking a still-masked cage give away anything
-    // about it. This checks the SAME notion of "currently visible"
-    // that the rest of the client uses (entry.displayedClueCount's
-    // stage, not merely "achieved" or "resolvable"), so it always
-    // matches what's actually on screen.
-    const stageIndex = Math.min(entry.displayedClueCount || 0, plan.achieved) - 1;
-    const visibleCageIds = stageIndex >= 0 ? plan.stages[stageIndex].cageIds : new Set();
-    if (!visibleCageIds.has(cageId)) return;
-
-    const op = cage.token[0];
-    const value = parseInt(cage.token.slice(1), 10);
-    if (!Number.isFinite(value)) return;
-
     const currentGrid = await getCurrentGrid();
     if (!currentGrid) return;
 
-    const result = cageCandidateDigits(w, cage.cells, op, value, currentGrid);
-    if (!result) return;
+    // Only ever act on a cell that's completely blank -- see this
+    // function's own doc comment above for why.
+    if (currentGrid[cellIndex] !== '0') return;
 
-    // Per-cell row/column elimination ("sees"), applied independently
-    // to each empty cell -- deliberately the ONLY thing this adds on
-    // top of the isolated-cage candidates: if a cell sees a digit
-    // elsewhere in its own row/column, that digit is excluded from
-    // THAT cell only, never inferred onto any other cell in the cage
-    // (see cageCandidateDigits()'s doc comment for the same "don't be
-    // smart" principle applied to the cage-arithmetic side).
-    const moveParts = [];
-    for (const cell of result.emptyCells) {
+    const currentPencilStr = await getCurrentPencil();
+    if (currentPencilStr) {
+        const currentPencil = currentPencilStr.split(',').map(Number);
+        if (currentPencil[cellIndex]) return;
+    }
+
+    // "The cage must have a known clue for this to work" (for the
+    // whole-cage, arithmetic-aware fill) -- this checks the SAME
+    // notion of "currently visible" that the rest of the client uses
+    // (entry.displayedClueCount's stage, not merely "achieved" or
+    // "resolvable"), so it always matches what's actually on screen.
+    const stageIndex = Math.min(entry.displayedClueCount || 0, plan.achieved) - 1;
+    const visibleCageIds = stageIndex >= 0 ? plan.stages[stageIndex].cageIds : new Set();
+    const cageIsClued = visibleCageIds.has(cageId);
+
+    // Ordinary row/column ("sees") elimination for a single cell,
+    // independent of any other cell -- shared by both modes below.
+    const rowColSeen = (cell) => {
         const row = Math.floor(cell / w);
         const col = cell % w;
         const seen = new Set();
@@ -1410,13 +1457,43 @@ async function handleCellDoubleRightClicked(tx, ty) {
             const ch = currentGrid[r * w + col];
             if (r !== row && ch !== '0') seen.add(ch.charCodeAt(0) - '0'.charCodeAt(0));
         }
+        return seen;
+    };
 
+    let moveParts;
+
+    if (cageIsClued) {
+        const op = cage.token[0];
+        const value = parseInt(cage.token.slice(1), 10);
+        if (!Number.isFinite(value)) return;
+
+        const result = cageCandidateDigits(w, cage.cells, op, value, currentGrid);
+        if (!result) return;
+
+        moveParts = [];
+        for (const cell of result.emptyCells) {
+            const seen = rowColSeen(cell);
+            let bitmask = 0;
+            for (const d of result.candidates) {
+                if (!seen.has(d)) bitmask |= (1 << d);
+            }
+            const row = Math.floor(cell / w);
+            const col = cell % w;
+            moveParts.push(`${col},${row},${bitmask}`);
+        }
+    } else {
+        // Unclued cage: no cage information is used at all -- just
+        // digits 1..w, row/column-eliminated, for the single clicked
+        // cell only (see this function's own doc comment above).
+        const seen = rowColSeen(cellIndex);
         let bitmask = 0;
-        for (const d of result.candidates) {
+        for (let d = 1; d <= w; d++) {
             if (!seen.has(d)) bitmask |= (1 << d);
         }
-        moveParts.push(`${col},${row},${bitmask}`);
+        if (bitmask === 0) return;
+        moveParts = [`${tx},${ty},${bitmask}`];
     }
+
     if (moveParts.length === 0) return;
 
     const err = await applyMove(`F${moveParts.join(';')}`);
@@ -1431,7 +1508,7 @@ const messageHandlers = {
     js_add_preset, js_add_preset_submenu, js_select_preset,
     js_dialog_init, js_dialog_string, js_dialog_choices, js_dialog_boolean, js_dialog_launch, js_dialog_cleanup,
     js_canvas_set_statusbar, js_canvas_remove_statusbar, js_canvas_set_size, js_error_box, js_focus_canvas,
-    savePuzzleDataCallback, getForcedDigitsCallback, getCurrentGridCallback,
+    savePuzzleDataCallback, getForcedDigitsCallback, getCurrentGridCallback, getCurrentPencilCallback,
     revealCluesCallback, loadPuzzleDataCallback, restartPuzzleCallback, puzzleResized,
     applyMoveCallback, cellDoubleRightClicked: handleCellDoubleRightClicked
 }

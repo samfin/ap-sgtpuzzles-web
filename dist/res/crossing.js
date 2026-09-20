@@ -258,6 +258,7 @@ var load_game
 // initPuzzle() below.
 var solve_partial_desc, free_solve_partial
 var get_current_grid, free_current_grid
+var get_current_pencil, free_current_pencil
 var reveal_clues
 var apply_move
 var resize_puzzle, restore_puzzle_size
@@ -687,6 +688,10 @@ function initPuzzle() {
     get_current_grid = Module.cwrap('get_current_grid', 'number', []);
     free_current_grid = Module.cwrap('free_current_grid', 'void',
                                       ['number']);
+
+    get_current_pencil = Module.cwrap('get_current_pencil', 'number', []);
+    free_current_pencil = Module.cwrap('free_current_pencil', 'void',
+                                        ['number']);
 
     reveal_clues = Module.cwrap('reveal_clues', 'string', ['string']);
     apply_move = Module.cwrap('apply_move', 'string', ['string']);
@@ -3378,6 +3383,8 @@ var _solve_partial_desc = Module['_solve_partial_desc'] = makeInvalidEarlyAccess
 var _free_solve_partial = Module['_free_solve_partial'] = makeInvalidEarlyAccess('_free_solve_partial');
 var _get_current_grid = Module['_get_current_grid'] = makeInvalidEarlyAccess('_get_current_grid');
 var _free_current_grid = Module['_free_current_grid'] = makeInvalidEarlyAccess('_free_current_grid');
+var _get_current_pencil = Module['_get_current_pencil'] = makeInvalidEarlyAccess('_get_current_pencil');
+var _free_current_pencil = Module['_free_current_pencil'] = makeInvalidEarlyAccess('_free_current_pencil');
 var _reveal_clues = Module['_reveal_clues'] = makeInvalidEarlyAccess('_reveal_clues');
 var _apply_move = Module['_apply_move'] = makeInvalidEarlyAccess('_apply_move');
 var _get_tilesize = Module['_get_tilesize'] = makeInvalidEarlyAccess('_get_tilesize');
@@ -3420,6 +3427,8 @@ function assignWasmExports(wasmExports) {
   assert(typeof wasmExports['free_solve_partial'] != 'undefined', 'missing Wasm export: free_solve_partial');
   assert(typeof wasmExports['get_current_grid'] != 'undefined', 'missing Wasm export: get_current_grid');
   assert(typeof wasmExports['free_current_grid'] != 'undefined', 'missing Wasm export: free_current_grid');
+  assert(typeof wasmExports['get_current_pencil'] != 'undefined', 'missing Wasm export: get_current_pencil');
+  assert(typeof wasmExports['free_current_pencil'] != 'undefined', 'missing Wasm export: free_current_pencil');
   assert(typeof wasmExports['reveal_clues'] != 'undefined', 'missing Wasm export: reveal_clues');
   assert(typeof wasmExports['apply_move'] != 'undefined', 'missing Wasm export: apply_move');
   assert(typeof wasmExports['get_tilesize'] != 'undefined', 'missing Wasm export: get_tilesize');
@@ -3459,6 +3468,8 @@ function assignWasmExports(wasmExports) {
   _free_solve_partial = Module['_free_solve_partial'] = createExportWrapper('free_solve_partial', wasmExports['free_solve_partial'], 1);
   _get_current_grid = Module['_get_current_grid'] = createExportWrapper('get_current_grid', wasmExports['get_current_grid'], 0);
   _free_current_grid = Module['_free_current_grid'] = createExportWrapper('free_current_grid', wasmExports['free_current_grid'], 1);
+  _get_current_pencil = Module['_get_current_pencil'] = createExportWrapper('get_current_pencil', wasmExports['get_current_pencil'], 0);
+  _free_current_pencil = Module['_free_current_pencil'] = createExportWrapper('free_current_pencil', wasmExports['free_current_pencil'], 1);
   _reveal_clues = Module['_reveal_clues'] = createExportWrapper('reveal_clues', wasmExports['reveal_clues'], 1);
   _apply_move = Module['_apply_move'] = createExportWrapper('apply_move', wasmExports['apply_move'], 1);
   _get_tilesize = Module['_get_tilesize'] = createExportWrapper('get_tilesize', wasmExports['get_tilesize'], 0);
