@@ -1392,6 +1392,15 @@ function applyMove(movestr) {
  * inferred onto any other cell (see cageCandidateDigits()'s doc
  * comment for the same "don't be smart" principle on the cage side).
  *
+ * If a cell's candidate set, after that row/column elimination, comes
+ * down to exactly one digit, that digit is certain -- it's filled in
+ * as a real digit instead of a single-candidate pencil mark (user's
+ * request; see onlyCandidateDigit()/movePartFor() below). This applies
+ * per cell, independently, in both modes: a clued cage's whole-cage
+ * fill can mix digit-fills and pencil-mark cells in the same move,
+ * and the unclued single-cell mode either fills that one cell's digit
+ * or pencils its candidates, whichever applies.
+ *
  * The double-right-clicked cell itself must be completely blank --
  * no real digit filled in, AND no pencil marks already present,
  * whether from an earlier double-right-click or the player's own
@@ -1460,6 +1469,35 @@ async function handleCellDoubleRightClicked(tx, ty) {
         return seen;
     };
 
+    // If a cell's FINAL candidate set (after row/column elimination)
+    // narrows down to exactly one digit, that digit is certain --
+    // fill it in as a real digit instead of a single-candidate pencil
+    // mark (user's request). Returns that digit, or null if `bitmask`
+    // has zero or more than one bit set (including the "no candidates
+    // at all" case, which is left as an empty pencil mark, unchanged
+    // from before this feature).
+    const onlyCandidateDigit = (bitmask) => {
+        let digit = null;
+        for (let d = 1; d <= w; d++) {
+            if (bitmask & (1 << d)) {
+                if (digit !== null) return null;
+                digit = d;
+            }
+        }
+        return digit;
+    };
+
+    // Builds one "F" move entry for a cell: a digit-fill ("x,y,Dn")
+    // if its bitmask has exactly one candidate left, otherwise the
+    // usual pencil-mark bitmask ("x,y,n") -- see the 'F' move's own
+    // doc comment in keen.c's execute_move() for the two entry forms.
+    const movePartFor = (col, row, bitmask) => {
+        const onlyDigit = onlyCandidateDigit(bitmask);
+        return onlyDigit !== null
+            ? `${col},${row},D${onlyDigit}`
+            : `${col},${row},${bitmask}`;
+    };
+
     let moveParts;
 
     if (cageIsClued) {
@@ -1479,7 +1517,7 @@ async function handleCellDoubleRightClicked(tx, ty) {
             }
             const row = Math.floor(cell / w);
             const col = cell % w;
-            moveParts.push(`${col},${row},${bitmask}`);
+            moveParts.push(movePartFor(col, row, bitmask));
         }
     } else {
         // Unclued cage: no cage information is used at all -- just
@@ -1491,7 +1529,7 @@ async function handleCellDoubleRightClicked(tx, ty) {
             if (!seen.has(d)) bitmask |= (1 << d);
         }
         if (bitmask === 0) return;
-        moveParts = [`${tx},${ty},${bitmask}`];
+        moveParts = [movePartFor(tx, ty, bitmask)];
     }
 
     if (moveParts.length === 0) return;
@@ -1788,41 +1826,48 @@ async function checkDigitGroupProgress(entry) {
         }
     }
 
-    // K < N: this client's search only ever achieves `plan.stages.length`
-    // distinct stages, which can be less than the world's configured
-    // digitGroupCount when no single line or pair of lines makes
-    // progress for long stretches (see Refinement 3's documented
-    // trade-off) -- the *final* achieved stage is always the complete
-    // puzzle regardless, so once it's correctly and fully filled in,
-    // also send every Digit Group location beyond what this client
-    // could present as its own separate stage, so none of them are
-    // permanently unreachable just because the search couldn't find
-    // that many genuine reveals.
-    if (targetCount === plan.stages.length) {
-        const finalForced = plan.stages[plan.stages.length - 1].forcedDigits;
-        const fullySolved = currentGrid.length === finalForced.length
-            && [...finalForced].every((d, i) => currentGrid[i] === d);
+    // The final achieved stage is always the complete puzzle (an
+    // invariant established since Refinement 3), regardless of how many
+    // Clue items have actually been received so far. This check is
+    // deliberately independent of `unlockedCount`/`targetCount`: the
+    // "puzzles solvable before their full clue budget" fix made
+    // mergeNoProgressStages() keep every post-solvability stage instead
+    // of collapsing them, so `plan.stages.length` can now sit at the
+    // world's full configured digitGroupCount (e.g. 25) even though the
+    // puzzle became solvable much earlier (e.g. at stage 11) -- gating
+    // this block on `targetCount === plan.stages.length` (the previous,
+    // buggy form) meant it never fired until every single Clue item for
+    // the puzzle had been received, silently preventing "Puzzle N Solved"
+    // and every not-yet-unlocked Digit Group from ever being released for
+    // an already-fully-solved puzzle. Checking `currentGrid` against the
+    // final stage's forced digits directly sidesteps that: once the grid
+    // truly matches, every remaining Digit Group location -- not just the
+    // ones beyond plan.stages.length, but also any earlier ones this
+    // player hasn't unlocked/checked yet -- plus "Puzzle N Solved" should
+    // be released, exactly as if every Clue item had already arrived.
+    const finalForced = plan.stages[plan.stages.length - 1].forcedDigits;
+    const fullySolved = currentGrid.length === finalForced.length
+        && [...finalForced].every((d, i) => currentGrid[i] === d);
 
-        if (fullySolved) {
-            const totalGroups = Math.max(plan.stages.length, entry.digitGroupCount || plan.stages.length);
-            for (let groupNumber = plan.stages.length + 1; groupNumber <= totalGroups; groupNumber++) {
-                const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${groupNumber}`);
-                if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
-                    client.check(locationId);
-                    newlyChecked = true;
-                }
-            }
-
-            // "Puzzle {index} Solved" -- a separate location from every Digit
-            // Group, added purely to give the world extra location capacity
-            // to back "Puzzle N" unlock items (see the AP world's
-            // items.py/rules.py). Same completion condition as the puzzle's
-            // final Digit Group, so it's safe to check here alongside them.
-            const solvedLocationId = locationNameToId(`Puzzle ${entry.index} Solved`);
-            if (solvedLocationId !== undefined && !client.room.checkedLocations.includes(solvedLocationId)) {
-                client.check(solvedLocationId);
+    if (fullySolved) {
+        const totalGroups = Math.max(plan.stages.length, entry.digitGroupCount || plan.stages.length);
+        for (let groupNumber = 1; groupNumber <= totalGroups; groupNumber++) {
+            const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${groupNumber}`);
+            if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
+                client.check(locationId);
                 newlyChecked = true;
             }
+        }
+
+        // "Puzzle {index} Solved" -- a separate location from every Digit
+        // Group, added purely to give the world extra location capacity
+        // to back "Puzzle N" unlock items (see the AP world's
+        // items.py/rules.py). Same completion condition as the puzzle's
+        // final Digit Group, so it's safe to check here alongside them.
+        const solvedLocationId = locationNameToId(`Puzzle ${entry.index} Solved`);
+        if (solvedLocationId !== undefined && !client.room.checkedLocations.includes(solvedLocationId)) {
+            client.check(solvedLocationId);
+            newlyChecked = true;
         }
     }
 

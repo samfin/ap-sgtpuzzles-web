@@ -561,8 +561,22 @@ function cageCandidateDigits(w, cageCells, op, value, currentGrid) {
     // Every non-decreasing (i.e. unordered/multiset) sequence of length
     // n from 1..w -- cheap at Keen's cage/grid sizes (at most
     // C(w+n-1, n), comfortably under a thousand even at w=9).
+    // A multiset where every cell in the cage (filled or not) would
+    // hold the identical digit is excluded outright -- e.g. a 2-cell
+    // x10 addition cage's {5,5} option never contributes a "5"
+    // candidate, even though {1,9}/{2,8}/{3,7}/{4,6} still do. This is
+    // a per-multiset exclusion, independent of admitsFilled/row-column
+    // "sees" logic: it's a deliberate simplification (a cage where
+    // every cell is the same value is real and legal whenever no two
+    // of its cells share a row/column, e.g. the earlier "15" duplicate
+    // example's 3-cell x25 cage), applied uniformly because it's the
+    // rarer, more confusing case to pencil in and the user asked for
+    // it to be left out.
+    const isMonochrome = (multiset) => n > 1 && multiset.every((d) => d === multiset[0]);
+
     const recurse = (start) => {
         if (current.length === n) {
+            if (isMonochrome(current)) return;
             if (!satisfiesClue(current)) return;
             const counts = countsOf(current);
             if (!admitsFilled(counts)) return;
