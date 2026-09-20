@@ -645,11 +645,15 @@ function keenDescriptorForCount(plan, unlockedCount) {
  * that turns out not to matter.
  *
  * If the currently-visible set already forces the entire grid (nothing
- * left for any reveal to gain), skips straight to adding one random
- * remaining line (or, once every line is already fully visible, one
- * random remaining cage) without probing any candidates --
- * mergeNoProgressStages() cleans up the resulting no-op stage
- * afterward regardless of what got picked.
+ * left for any reveal to *logically* gain), skips straight to adding one
+ * random still-hidden cage without probing any candidates -- purely so
+ * the player keeps seeing more of the puzzle's real clues as they earn
+ * more "Clue" items, even past the point where nothing new is
+ * deducible. Unlike every other stage here, mergeNoProgressStages()
+ * (called by resolveKeenStagePlan() below with the puzzle's w*w cell
+ * count) deliberately does NOT collapse these into one -- see its own
+ * doc comment for why a puzzle solvable from fewer than its full clue
+ * count would otherwise never show its remaining cages at all.
  *
  * Returns { cageIds, forced, forcedDigits, level } for the chosen
  * reveal (cageIds is just the *added* cage ids, not the cumulative
@@ -703,10 +707,15 @@ async function chooseNextStageReveal(parsed, paramsStr, visible, cagesForLine, p
     };
 
     if (prevForced >= w * w) {
-        if (remainingLines.length > 0) {
-            const line = seededShuffleCopy(remainingLines, `${seedInput}:already-solved`)[0];
-            return { ...(await evaluateLines([line])), level: 'already-solved' };
-        }
+        // The grid is already fully deducible from what's visible so far --
+        // there's nothing left any reveal could logically teach. Per the
+        // user's request, keep adding cages anyway, one at a time and
+        // purely for the player to see (cageCandidateDigits()-style
+        // "double-right-click" fills work the same regardless of whether a
+        // cage's clue was strictly *needed*), until every cage is visible.
+        // Picking a single cage (rather than a whole line, which can touch
+        // several cages at once) is what makes this exactly "1 extra cage
+        // per stage" rather than a variable-sized batch.
         const cageId = seededShuffleCopy(remainingCages, `${seedInput}:already-solved-cage`)[0];
         return { ...(await evaluateCages([cageId])), level: 'already-solved' };
     }
@@ -773,14 +782,19 @@ async function chooseNextStageReveal(parsed, paramsStr, visible, cagesForLine, p
  * on is pure-JS re-masking of the same parsed structure.
  *
  * Each stage's reveal is chosen by chooseNextStageReveal() above (lines
- * first, falling back to individual cages), except the very last stage
- * the world's digit_group_count allows, which always takes every still-
- * hidden cage at once regardless of what a smaller reveal would do --
- * this is what guarantees a player holding every Clue item for a
- * puzzle always sees the complete thing, not a partially-clued dead
- * end. mergeNoProgressStages() is still run as a final defensive pass,
- * though by construction every non-final stage here should already
- * strictly increase its forced-digit count over the last.
+ * first, falling back to individual cages, and once the grid is already
+ * fully deducible, one random still-hidden cage per stage purely for
+ * the player to see -- see that function's own doc comment), except
+ * the very last stage the world's digit_group_count allows, which
+ * always takes every still-hidden cage at once regardless of what a
+ * smaller reveal would do -- this is what guarantees a player holding
+ * every Clue item for a puzzle always sees the complete thing, not a
+ * partially-clued dead end. mergeNoProgressStages() is still run as a
+ * final pass, now with the puzzle's w*w cell count so it keeps every
+ * stage from the point of full solvability onward instead of merging
+ * them away (their forced-digit count legitimately ties at w*w from
+ * then on, by design -- see mergeNoProgressStages()'s own doc comment
+ * for why that's no longer treated as "no progress").
  */
 
 async function resolveKeenStagePlan(entry, gameId) {
@@ -854,7 +868,7 @@ async function resolveKeenStagePlan(entry, gameId) {
         forcedCounts.push(chosenForced);
     }
 
-    const mergedStages = mergeNoProgressStages(stages, forcedCounts);
+    const mergedStages = mergeNoProgressStages(stages, forcedCounts, w * w);
 
     entry.stagePlan = { paramsStr, w, parsed, achieved: mergedStages.length, stages: mergedStages };
 }

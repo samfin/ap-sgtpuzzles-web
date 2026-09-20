@@ -413,10 +413,31 @@ function countForcedDigits(forcedDigitString) {
  * src/puzzles.js). A structural division can produce a group whose clue
  * doesn't newly pin down any cell on its own -- very common for the
  * very first group (a handful of addition/subtraction cages alone often
- * force nothing), and possible near the end once the puzzle is already
- * fully determined by an earlier group. Every "digit group" a player
- * unlocks should actually teach them something, so those stages are
- * folded into the next one instead of being shown as their own group.
+ * force nothing) -- and those "boring" early stages are folded into the
+ * next one instead of being shown as their own group, so every "digit
+ * group" a player unlocks up to the point of full solvability actually
+ * teaches them something.
+ *
+ * `fullForceThreshold` (the puzzle's full cell count, w*w) changes this
+ * once the grid is already completely deducible: per the user's request
+ * ("I want each subsequent clue group to reveal 1 extra cage at random
+ * if there are unclued cages available"), a stage from that point on is
+ * kept *regardless* of whether it changes the forced-digit count at all
+ * -- chooseNextStageReveal()'s own "already-solved" fast path only ever
+ * adds one still-hidden cage per such stage (purely for the player to
+ * see, since there's nothing left to logically deduce), and those
+ * cosmetic-only reveals are exactly what this exception is for. Without
+ * it, every stage past the point of full solvability would tie at the
+ * same forced count and collapse into one, so a puzzle solvable from
+ * only 15 of its 25 available clue groups would never show the other
+ * 10 cages' clues no matter how many more "Clue" items the player
+ * received -- leaving them permanently hidden except via the mandatory
+ * full reveal on the world's very last configured stage (see
+ * resolveKeenStagePlan()'s isFinalAllowedStage). This world's only
+ * caller (resolveKeenStagePlan()) always passes w*w; the parameter is
+ * optional (rather than baked in) only so this function's own
+ * behavior stays independently testable/describable without requiring
+ * a specific puzzle size.
  *
  * Cumulative masked descriptors already contain every earlier stage's
  * cages, so dropping a no-progress stage k is exactly "merge its cages
@@ -429,14 +450,15 @@ function countForcedDigits(forcedDigitString) {
  * start and this can't degenerate to zero real puzzles; the length-1
  * fallback below is just a defensive backstop.)
  */
-function mergeNoProgressStages(stages, forcedCounts) {
+function mergeNoProgressStages(stages, forcedCounts, fullForceThreshold) {
     if (stages.length !== forcedCounts.length) {
         throw new Error(`stages/forcedCounts length mismatch: ${stages.length} vs ${forcedCounts.length}`);
     }
     const kept = [];
     let lastCount = 0;
     for (let k = 0; k < stages.length; k++) {
-        if (forcedCounts[k] > lastCount) {
+        const alreadyFullyForced = fullForceThreshold !== undefined && lastCount >= fullForceThreshold;
+        if (forcedCounts[k] > lastCount || alreadyFullyForced) {
             kept.push(stages[k]);
             lastCount = forcedCounts[k];
         }
