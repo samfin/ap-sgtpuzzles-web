@@ -262,3 +262,14 @@ body {
 .chat-message input:not([type='submit']) {
     flex-grow: 1;
 }
+
+/* The three puzzle-view highlight/grey-out toggle buttons keep a fixed
+   label at all times (never swapping to a "Hide ..."/"Show ..." variant),
+   so their width -- and therefore every other button's position in the
+   row -- never shifts when toggled. On/off state is shown with this class
+   instead, the same bold-text/light-blue-background idiom already used
+   for .selected elsewhere in this file. */
+.toggle-button.toggle-on {
+    font-weight: bold;
+    background-color: #ccf;
+}

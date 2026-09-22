@@ -1802,13 +1802,13 @@ function toggleNextGroupHighlight() {
  * unlocked yet, or every unlocked group is already solved), there's
  * nothing to grey out -- correctly empty, not an error.
  *
- * Deliberately scoped to plan.stages[displayedIndex].cageIds (the cages
- * actually sent to the native engine so far, per entry.displayedClueCount
- * -- the same clamp keenVisibleId()/liveRevealClues() use) rather than
- * every cage the plan could eventually reveal: a still-masked cage shows
- * no clue text either way, so there's nothing on screen to fade, and
- * greying cells with no visible clue would just look like a stray grey
- * box with no explanation.
+ * Scoped to every cage in the whole puzzle (plan.parsed.cages), not just
+ * ones already unlocked: a cage the player hasn't earned the clue for yet
+ * shows no clue text either way, but it still isn't needed for the target
+ * group, so it's greyed out the same as an unlocked-but-extra cage would
+ * be -- consistent treatment for "not needed right now," per the user's
+ * explicit request, rather than distinguishing "extra and visible" from
+ * "extra and still masked."
  */
 function extraClueCells(entry) {
     const plan = entry && entry.stagePlan;
@@ -1831,12 +1831,16 @@ function extraClueCells(entry) {
 
     const neededCageIds = plan.stages[targetGroupNumber - 1].cageIds;
 
-    const displayedIndex = Math.min(entry.displayedClueCount || 0, plan.achieved) - 1;
-    if (displayedIndex < 0) return [];
-    const visibleCageIds = plan.stages[displayedIndex].cageIds;
-
+    // Grey out every cage that isn't needed for the target group -- not just
+    // ones the player has already unlocked (whose clue text is genuinely
+    // visible and being de-emphasized), but also every still-masked cage
+    // (which shows no clue text at all yet). Per the user's explicit "might
+    // as well be consistent" request: a masked cage isn't needed for the
+    // target group either, so it gets the same grey treatment as an
+    // unlocked-but-extra one, rather than looking different (untouched)
+    // purely because the player hasn't earned its clue yet.
     const cells = [];
-    for (const cageId of visibleCageIds) {
+    for (const cageId of plan.parsed.cages.keys()) {
         if (!neededCageIds.has(cageId)) {
             for (const cell of plan.parsed.cages.get(cageId).cells) cells.push(cell);
         }
@@ -1866,9 +1870,11 @@ function refreshExtraClueGreyOut(entry) {
 /**
  * Toggle a second overlay (independent of "highlight next group" above,
  * drawn in its own sibling div so the two can be shown together without
- * interfering with each other's clear/redraw) that greys out every
- * currently-visible clue cage not needed to reach the next unsolved
- * digit group -- see extraClueCells() for exactly which cages that is.
+ * interfering with each other's clear/redraw) that greys out every cage
+ * not needed to reach the next unsolved digit group -- both cages the
+ * player has already unlocked but doesn't need yet, and cages still
+ * fully masked (no clue text shown at all), treated identically for
+ * consistency -- see extraClueCells() for exactly which cages that is.
  * A no-op (leaves it off) if the current puzzle has no resolved
  * stagePlan, same as toggleNextGroupHighlight().
  *
