@@ -354,6 +354,13 @@ function initStores() {
         // re-sends it for the newly-loaded puzzle whenever this is true
         // (see refreshNextGroupHighlight()).
         highlightingNextGroup: false,
+        // Whether the player wants the "grey out extra clues" overlay
+        // shown (see toggleExtraClueGreyOut()). Deliberately NOT reset
+        // by reset() below, for the same reason as highlightingNextGroup
+        // just above: the preference should survive a puzzle switch,
+        // and js_post_init() re-sends it for the newly-loaded puzzle
+        // whenever this is true (see refreshExtraClueGreyOut()).
+        greyingExtraClues: false,
         reset() {
             this.solved = false;
             this.undoEnabled = false;
@@ -1083,6 +1090,9 @@ function js_post_init() {
     // at all (a fresh iframe never carries the previous one's overlay
     // over, even though the on/off preference itself now persists).
     refreshNextGroupHighlight(Alpine.store("puzzleList").current);
+    // Same idea, for the "grey out extra clues" overlay -- see
+    // refreshExtraClueGreyOut()'s doc comment.
+    refreshExtraClueGreyOut(Alpine.store("puzzleList").current);
 }
 
 // The iframe reports back here (see the puzzleResized sendMessage calls
@@ -1767,6 +1777,111 @@ function toggleNextGroupHighlight() {
 }
 
 /**
+ * Which currently-*displayed* cells belong to a cage that isn't needed
+ * to reach the next unsolved digit group -- i.e. clues the player has
+ * already unlocked and can see, but that are irrelevant to whatever
+ * check is next (e.g. groups 1-2 solved, group 3 next: any cages
+ * revealed by groups 4+ that aren't already part of group 3's own cage
+ * set get greyed out, so the player isn't distracted hunting through
+ * clues that won't help the immediate next check).
+ *
+ * "Next unsolved group" is found the same way nextGroupHighlightCells()
+ * finds it (see that function's own doc comment for why this can't
+ * just be checkedGroupCount + 1 -- checks aren't guaranteed to land in
+ * solve order). If there's no next unsolved group at all (nothing
+ * unlocked yet, or every unlocked group is already solved), there's
+ * nothing to grey out -- correctly empty, not an error.
+ *
+ * Deliberately scoped to plan.stages[displayedIndex].cageIds (the cages
+ * actually sent to the native engine so far, per entry.displayedClueCount
+ * -- the same clamp keenVisibleId()/liveRevealClues() use) rather than
+ * every cage the plan could eventually reveal: a still-masked cage shows
+ * no clue text either way, so there's nothing on screen to fade, and
+ * greying cells with no visible clue would just look like a stray grey
+ * box with no explanation.
+ */
+function extraClueCells(entry) {
+    const plan = entry && entry.stagePlan;
+    if (!plan) return [];
+
+    const unlockedCount = isApReady() ? countReceivedClueSets(entry.index) : 0;
+    const reachableCount = Math.min(unlockedCount, plan.stages.length);
+
+    let targetGroupNumber = 0;
+    if (isApReady()) {
+        for (let g = 1; g <= reachableCount; g++) {
+            const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
+            if (locationId === undefined || !client.room.checkedLocations.includes(locationId)) {
+                targetGroupNumber = g;
+                break;
+            }
+        }
+    }
+    if (targetGroupNumber === 0) return [];
+
+    const neededCageIds = plan.stages[targetGroupNumber - 1].cageIds;
+
+    const displayedIndex = Math.min(entry.displayedClueCount || 0, plan.achieved) - 1;
+    if (displayedIndex < 0) return [];
+    const visibleCageIds = plan.stages[displayedIndex].cageIds;
+
+    const cells = [];
+    for (const cageId of visibleCageIds) {
+        if (!neededCageIds.has(cageId)) {
+            for (const cell of plan.parsed.cages.get(cageId).cells) cells.push(cell);
+        }
+    }
+    return cells;
+}
+
+/**
+ * Re-send the "grey out extra clues" overlay for `entry`, but only if
+ * the player actually has it turned on (puzzleState.greyingExtraClues)
+ * -- a harmless no-op otherwise, so every call site below can call this
+ * unconditionally. Same two callers, for the same reasons, as
+ * refreshNextGroupHighlight() right above:
+ *  - js_post_init(), so the setting persists across a puzzle switch.
+ *  - syncAPStatus(), so solving the next-needed group (or receiving a
+ *    new Clue item) immediately recomputes which cages are now "extra"
+ *    without the player re-toggling the button.
+ */
+function refreshExtraClueGreyOut(entry) {
+    const puzzleState = Alpine.store("puzzleState");
+    if (!puzzleState.greyingExtraClues) return;
+
+    const plan = entry && entry.stagePlan;
+    sendMessage("setExtraClueGreyOut", extraClueCells(entry), plan && plan.w);
+}
+
+/**
+ * Toggle a second overlay (independent of "highlight next group" above,
+ * drawn in its own sibling div so the two can be shown together without
+ * interfering with each other's clear/redraw) that greys out every
+ * currently-visible clue cage not needed to reach the next unsolved
+ * digit group -- see extraClueCells() for exactly which cages that is.
+ * A no-op (leaves it off) if the current puzzle has no resolved
+ * stagePlan, same as toggleNextGroupHighlight().
+ *
+ * The on/off state this sets (puzzleState.greyingExtraClues) persists
+ * across puzzle switches -- see refreshExtraClueGreyOut().
+ */
+function toggleExtraClueGreyOut() {
+    const puzzleState = Alpine.store("puzzleState");
+
+    if (puzzleState.greyingExtraClues) {
+        puzzleState.greyingExtraClues = false;
+        sendMessage("setExtraClueGreyOut", null);
+        return;
+    }
+
+    const entry = Alpine.store("puzzleList").current;
+    if (!entry || !entry.stagePlan) return;
+
+    puzzleState.greyingExtraClues = true;
+    refreshExtraClueGreyOut(entry);
+}
+
+/**
  * Stage 4: send the Archipelago location check for a digit group as
  * soon as the player has actually, correctly filled in its cells --
  * not when the engine's own "solved" callback fires (js_update_status),
@@ -2083,6 +2198,9 @@ function syncAPStatus() {
         // "next"), move the highlight on without making the player
         // toggle it off and back on -- see refreshNextGroupHighlight().
         refreshNextGroupHighlight(puzzleList.current);
+        // Same idea, for the "grey out extra clues" overlay -- see
+        // refreshExtraClueGreyOut().
+        refreshExtraClueGreyOut(puzzleList.current);
     }
 
     if (anyNewRemoteSolves) {
@@ -2681,6 +2799,7 @@ window.undoPuzzle = undoPuzzle;
 window.redoPuzzle = redoPuzzle;
 window.solvePuzzle = solvePuzzle;
 window.toggleNextGroupHighlight = toggleNextGroupHighlight;
+window.toggleExtraClueGreyOut = toggleExtraClueGreyOut;
 window.setPreset = setPreset;
 window.savePuzzleData = savePuzzleData;
 window.loadPuzzleData = loadPuzzleData;

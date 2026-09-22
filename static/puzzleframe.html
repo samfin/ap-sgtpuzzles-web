@@ -54,12 +54,39 @@ body {
     box-sizing: border-box;
 }
 
+/* Overlay for the "grey out extra clues" toggle (see
+   toggleExtraClueGreyOut() in src/puzzles.js and
+   setExtraClueGreyOut() below). Its own sibling of #digitGroupHighlight,
+   not a shared div, so the two toggles can be shown together without
+   one's redraw clearing the other's boxes. Same sizing/positioning
+   rationale as #digitGroupHighlight above. Placed earlier in the DOM
+   (see the body markup below) so the amber "next group" highlight, if
+   also on, paints on top of the grey overlay rather than under it --
+   in practice the two never target the same cell (a cell needed for
+   the next group is never also "extra"), but this keeps the intended
+   focus indicator on top if that ever changes. */
+#extraClueGreyOut {
+    position: absolute;
+    top: 0px;
+    left: 0px;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.extra-clue-greyout-cell {
+    position: absolute;
+    background-color: rgba(60, 60, 60, 0.6);
+    box-sizing: border-box;
+}
+
     </style>
 </head>
 
 <body>
     <div id="resizable">
         <canvas id="puzzlecanvas" tabindex="0"></canvas>
+        <div id="extraClueGreyOut"></div>
         <div id="digitGroupHighlight"></div>
         <svg id="resizehandle" aria-label="resize" width='10' height='10'>
             <title>Drag to resize the puzzle. Right-click to restore the default size.</title>

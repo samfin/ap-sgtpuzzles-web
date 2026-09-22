@@ -313,6 +313,39 @@ function setDigitGroupHighlight(cells, w) {
     }
 }
 
+// Show or clear the "grey out extra clues" overlay (see
+// toggleExtraClueGreyOut() in src/puzzles.js, which computes which
+// currently-visible cells belong to cages not needed for the next
+// unsolved digit group -- this function only knows how to draw them).
+// Deliberately its own sibling overlay div/CSS class rather than
+// reusing #digitGroupHighlight, so the two toggles have independent
+// clear/redraw lifecycles and can be shown together -- otherwise
+// turning one off would wipe out the other's boxes too, since both
+// call overlay.innerHTML = "" on every redraw. Same cell-to-percentage
+// geometry as setDigitGroupHighlight() above; see its comment for why
+// that needs no pixel measurement or WASM export call.
+function setExtraClueGreyOut(cells, w) {
+    const overlay = document.getElementById("extraClueGreyOut");
+    if (!overlay) return;
+
+    overlay.innerHTML = "";
+    if (!cells || !w) return;
+
+    const cellPercent = 100 / (w + 1);
+    for (const cell of cells) {
+        const row = Math.floor(cell / w);
+        const col = cell % w;
+
+        const div = document.createElement("div");
+        div.className = "extra-clue-greyout-cell";
+        div.style.left = `${(col + 0.5) * cellPercent}%`;
+        div.style.top = `${(row + 0.5) * cellPercent}%`;
+        div.style.width = `${cellPercent}%`;
+        div.style.height = `${cellPercent}%`;
+        overlay.appendChild(div);
+    }
+}
+
 const messageHandlers = {
     loadPuzzle, setPreset, showPreferences,
     puzzleFromId, puzzleFromSeed,
@@ -320,7 +353,7 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData,
-    getForcedDigits, setDigitGroupHighlight, getCurrentGrid, getCurrentPencil,
+    getForcedDigits, setDigitGroupHighlight, setExtraClueGreyOut, getCurrentGrid, getCurrentPencil,
     revealClues, applyMove
 }
 
