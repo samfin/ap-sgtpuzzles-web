@@ -101,6 +101,10 @@ entry.locked ? 'locked' : 'unlocked', entry.collected ? 'collected' : 'uncollect
                     x-text="$store.puzzleState.highlightingNextGroup ? 'Hide next group' : 'Highlight next group'">
                         Highlight next group
                     </button>
+                    <button onclick="toggleAmbiguousOrderHighlight()" :disabled="!$store.puzzleState.loaded"
+                    x-text="$store.puzzleState.highlightingAmbiguousOrder ? 'Hide ambiguous order' : 'Highlight ambiguous order'">
+                        Highlight ambiguous order
+                    </button>
                     <button onclick="toggleExtraClueGreyOut()" :disabled="!$store.puzzleState.loaded"
                     x-text="$store.puzzleState.greyingExtraClues ? 'Show all clues' : 'Grey out extra clues'">
                         Grey out extra clues

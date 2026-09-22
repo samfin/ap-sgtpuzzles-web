@@ -598,6 +598,191 @@ function cageCandidateDigits(w, cageCells, op, value, currentGrid) {
     return { candidates, emptyCells };
 }
 
+/**
+ * Determines, for a single cage, which of its own arithmetic-admissible
+ * digit multisets are actually FEASIBLE once each empty cell's own
+ * row/column ("sees") exclusions are taken into account -- unlike
+ * cageCandidateDigits() above (deliberately "dumb", cage-only, for the
+ * double-right-click fill feature), this DOES cross-check row/column
+ * information against candidate compositions, because the whole point
+ * here is to tell "the cage's digit SET is uniquely pinned down by
+ * everything visible so far" apart from "which cell gets which digit
+ * is also pinned down" -- e.g. a 2-cell 6x cage ({1,6} or {2,3}) where
+ * BOTH empty cells already see a 1 elsewhere in their own row/column:
+ * {1,6} can never actually be placed (neither cell could hold the 1),
+ * so only {2,3} remains admissible, even though a naive cage-only look
+ * would still call the cage ambiguous between the two (user's own
+ * example, verified below in verify_order_ambiguity.js).
+ *
+ * For each cage-arithmetic-admissible multiset (same enumeration and
+ * filters as cageCandidateDigits(): satisfies the clue, respects
+ * digits already filled in this SAME cage via admitsFilled(), and
+ * excludes a fully monochrome multiset), checks every distinct way of
+ * assigning its still-needed digits to the cage's empty cells, and
+ * discards the multiset entirely if NONE of those assignments avoids
+ * every cell's own row/column exclusions. Cage sizes are always <=6
+ * (MAXBLK in keen.c), so brute-force permutation here is always cheap.
+ *
+ * `knownGrid` supplies both which cells already hold a real digit
+ * (row*w+col-indexed digit-character string, '0' for undetermined)
+ * and, together with `w`, every cell's row/column exclusion set --
+ * callers pass whatever grid represents "everything currently known"
+ * (e.g. a stage's own solved-so-far forcedDigits, or the player's live
+ * entries), exactly the way cageCandidateDigits() already does.
+ *
+ * Returns null if the cage has no empty cells left. Otherwise
+ * { emptyCells: number[], multisetCount: number, perCellCandidates:
+ * Map<cell, Set<digit>> }. multisetCount is how many DISTINCT
+ * multisets survived the feasibility check -- exactly 1 means the
+ * cage's digit COMPOSITION is uniquely known, even if a given cell's
+ * own perCellCandidates entry still has more than one digit in it
+ * (i.e. the composition is known but which cell gets which digit --
+ * the ORDER -- remains ambiguous for that cell). perCellCandidates
+ * maps each empty cell to the set of digits it could hold in at least
+ * one surviving, feasible assignment, across every surviving multiset
+ * -- so a cell whose entry has exactly one digit is fully deducible
+ * (forced) regardless of multisetCount, same as a solver's ordinary
+ * "naked single", even when the cage's overall composition is NOT
+ * uniquely known (see the "2-" worked example in progress-notes.md:
+ * composition ambiguous between {2,4}/{4,6}, but one cell is still
+ * individually forced to 4 because every surviving multiset's every
+ * feasible assignment happens to put a 4 there).
+ */
+function cageOrderAmbiguity(w, cageCells, op, value, knownGrid) {
+    const filledCounts = new Map();
+    const emptyCells = [];
+    for (const cell of cageCells) {
+        const ch = knownGrid ? knownGrid[cell] : '0';
+        if (ch && ch !== '0') {
+            const d = ch.charCodeAt(0) - '0'.charCodeAt(0);
+            filledCounts.set(d, (filledCounts.get(d) || 0) + 1);
+        } else {
+            emptyCells.push(cell);
+        }
+    }
+    if (emptyCells.length === 0) return null;
+
+    const n = cageCells.length;
+    if ((op === 's' || op === 'd') && n !== 2) return null;
+
+    const satisfiesClue = (multiset) => {
+        if (op === 'a') return multiset.reduce((a, b) => a + b, 0) === value;
+        if (op === 'm') return multiset.reduce((a, b) => a * b, 1) === value;
+        if (op === 's') return Math.abs(multiset[0] - multiset[1]) === value;
+        if (op === 'd') {
+            const hi = Math.max(multiset[0], multiset[1]);
+            const lo = Math.min(multiset[0], multiset[1]);
+            return lo !== 0 && hi % lo === 0 && hi / lo === value;
+        }
+        return false;
+    };
+
+    const countsOf = (multiset) => {
+        const counts = new Map();
+        for (const v of multiset) counts.set(v, (counts.get(v) || 0) + 1);
+        return counts;
+    };
+
+    const admitsFilled = (counts) => {
+        for (const [d, c] of filledCounts) {
+            if ((counts.get(d) || 0) < c) return false;
+        }
+        return true;
+    };
+
+    const isMonochrome = (multiset) => n > 1 && multiset.every((d) => d === multiset[0]);
+
+    // Row/column exclusion set for one cell, computed from knownGrid --
+    // same per-cell independence (never inferred onto another cell)
+    // as cageCandidateDigits()'s own caller-side elimination.
+    const excludedFor = (cell) => {
+        const row = Math.floor(cell / w);
+        const col = cell % w;
+        const seen = new Set();
+        for (let c = 0; c < w; c++) {
+            const ch = knownGrid[row * w + c];
+            if (c !== col && ch !== '0') seen.add(ch.charCodeAt(0) - '0'.charCodeAt(0));
+        }
+        for (let r = 0; r < w; r++) {
+            const ch = knownGrid[r * w + col];
+            if (r !== row && ch !== '0') seen.add(ch.charCodeAt(0) - '0'.charCodeAt(0));
+        }
+        return seen;
+    };
+    const exclusions = emptyCells.map(excludedFor);
+
+    // Every distinct permutation of a (possibly-repeating) digit list,
+    // without generating duplicate permutations for repeated values --
+    // cage sizes are always <=6, so this stays cheap even in the
+    // worst case (6! = 720).
+    const distinctPermutations = (digits) => {
+        const results = [];
+        const used = new Array(digits.length).fill(false);
+        const current = [];
+        const sorted = [...digits].sort((a, b) => a - b);
+        const recurse = () => {
+            if (current.length === sorted.length) {
+                results.push([...current]);
+                return;
+            }
+            for (let i = 0; i < sorted.length; i++) {
+                if (used[i]) continue;
+                if (i > 0 && sorted[i] === sorted[i - 1] && !used[i - 1]) continue;
+                used[i] = true;
+                current.push(sorted[i]);
+                recurse();
+                current.pop();
+                used[i] = false;
+            }
+        };
+        recurse();
+        return results;
+    };
+
+    let multisetCount = 0;
+    const perCellCandidates = new Map();
+    for (const cell of emptyCells) perCellCandidates.set(cell, new Set());
+
+    const current = [];
+    const recurseMultisets = (start) => {
+        if (current.length === n) {
+            if (isMonochrome(current)) return;
+            if (!satisfiesClue(current)) return;
+            const counts = countsOf(current);
+            if (!admitsFilled(counts)) return;
+            for (const [d, c] of filledCounts) counts.set(d, (counts.get(d) || 0) - c);
+            const remaining = [];
+            for (const [d, c] of counts) {
+                for (let i = 0; i < c; i++) remaining.push(d);
+            }
+
+            let feasible = false;
+            for (const perm of distinctPermutations(remaining)) {
+                let ok = true;
+                for (let i = 0; i < perm.length; i++) {
+                    if (exclusions[i].has(perm[i])) { ok = false; break; }
+                }
+                if (ok) {
+                    feasible = true;
+                    for (let i = 0; i < perm.length; i++) {
+                        perCellCandidates.get(emptyCells[i]).add(perm[i]);
+                    }
+                }
+            }
+            if (feasible) multisetCount++;
+            return;
+        }
+        for (let d = start; d <= w; d++) {
+            current.push(d);
+            recurseMultisets(d);
+            current.pop();
+        }
+    };
+    recurseMultisets(1);
+
+    return { emptyCells, multisetCount, perCellCandidates };
+}
+
 module.exports = {
     parseKeenDescriptor,
     buildMaskedDescriptor,
@@ -612,6 +797,7 @@ module.exports = {
     countForcedDigits,
     mergeNoProgressStages,
     cageCandidateDigits,
+    cageOrderAmbiguity,
     _hashStringToSeed: hashStringToSeed,
     _mulberry32: mulberry32,
 };

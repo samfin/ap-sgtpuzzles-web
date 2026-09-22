@@ -9,7 +9,7 @@ const SaveData = require("./savedata.js");
 const {GameSave, getFile, getFileList, openDatabase} = SaveData;
 const {config} = require("config")
 const {genres, genreInfo} = require("./genres.js")
-const {parseKeenDescriptor, buildMaskedDescriptor, touchingCagesByLine, rowColStartCandidates, allLines, seededShuffleCopy, countForcedDigits, mergeNoProgressStages, cageCandidateDigits} = require("./keenDivision.js")
+const {parseKeenDescriptor, buildMaskedDescriptor, touchingCagesByLine, rowColStartCandidates, allLines, seededShuffleCopy, countForcedDigits, mergeNoProgressStages, cageCandidateDigits, cageOrderAmbiguity} = require("./keenDivision.js")
 
 document.addEventListener("alpine:init", onInit)
 
@@ -361,6 +361,13 @@ function initStores() {
         // and js_post_init() re-sends it for the newly-loaded puzzle
         // whenever this is true (see refreshExtraClueGreyOut()).
         greyingExtraClues: false,
+        // Whether the player wants the "ambiguous cage order" overlay
+        // shown (see toggleAmbiguousOrderHighlight()). Deliberately NOT
+        // reset by reset() below, same reason as the two flags above:
+        // the preference should survive a puzzle switch, and
+        // js_post_init() re-sends it for the newly-loaded puzzle
+        // whenever this is true (see refreshAmbiguousOrderHighlight()).
+        highlightingAmbiguousOrder: false,
         reset() {
             this.solved = false;
             this.undoEnabled = false;
@@ -1093,6 +1100,9 @@ function js_post_init() {
     // Same idea, for the "grey out extra clues" overlay -- see
     // refreshExtraClueGreyOut()'s doc comment.
     refreshExtraClueGreyOut(Alpine.store("puzzleList").current);
+    // Same idea again, for the "ambiguous cage order" overlay -- see
+    // refreshAmbiguousOrderHighlight()'s doc comment.
+    refreshAmbiguousOrderHighlight(Alpine.store("puzzleList").current);
 }
 
 // The iframe reports back here (see the puzzleResized sendMessage calls
@@ -1882,6 +1892,129 @@ function toggleExtraClueGreyOut() {
 }
 
 /**
+ * Cells whose cage's digit COMPOSITION is uniquely deducible from
+ * clues up to (and including) the next unsolved digit group -- even
+ * though which specific cell holds which digit isn't yet determined
+ * (the ORDER is still ambiguous). E.g. a 2-cell cage clued "15x" is
+ * always {3,5} regardless of context (only one multiset multiplies to
+ * 15), so both its cells count here unless something ALSO pins down
+ * which cell gets which digit; a 2-cell "6x" cage ({1,6} or {2,3})
+ * only counts once row/column context rules out one of those two
+ * multisets entirely (e.g. both cells already see a 1 somewhere in
+ * their own row/column, so {1,6} could never actually be placed).
+ *
+ * Deliberately scoped to `plan.stages[targetGroupNumber - 1]` --
+ * both its cageIds (which cages count as "visible" at all) AND its
+ * own forcedDigits (what's already known, standing in for "the
+ * board") -- matching "only use clues up to the next digit set"
+ * exactly: forcedDigits is the real solver's own output for exactly
+ * that clue subset (see resolveKeenStagePlan()), not the player's
+ * live entries, so this reflects what's deducible from the clues
+ * alone, independent of how far the player has actually gotten.
+ * "Next unsolved group" is found the same way nextGroupHighlightCells()
+ * finds it -- see that function's own doc comment for why this can't
+ * just be checkedGroupCount + 1.
+ *
+ * The actual composition/order reasoning is cageOrderAmbiguity() in
+ * keenDivision.js -- see its own doc comment for the full algorithm
+ * (why this needs to be smarter than cageCandidateDigits()'s
+ * deliberately cage-only reasoning). A cell only counts here if its
+ * cage's composition is uniquely known (multisetCount === 1) AND that
+ * cell itself still has more than one candidate digit -- a cell
+ * that's individually forced to a single digit (whether or not its
+ * cage's composition is uniquely known) is not order-ambiguous, so
+ * it's left for the existing "highlight next group" overlay instead,
+ * not this one.
+ */
+function deducibleCompositionCells(entry) {
+    const plan = entry && entry.stagePlan;
+    if (!plan) return [];
+
+    const unlockedCount = isApReady() ? countReceivedClueSets(entry.index) : 0;
+    const reachableCount = Math.min(unlockedCount, plan.stages.length);
+
+    let targetGroupNumber = 0;
+    if (isApReady()) {
+        for (let g = 1; g <= reachableCount; g++) {
+            const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
+            if (locationId === undefined || !client.room.checkedLocations.includes(locationId)) {
+                targetGroupNumber = g;
+                break;
+            }
+        }
+    }
+    if (targetGroupNumber === 0) return [];
+
+    const stage = plan.stages[targetGroupNumber - 1];
+    const forcedDigits = stage.forcedDigits;
+    const w = plan.w;
+
+    const cells = [];
+    for (const cageId of stage.cageIds) {
+        const cage = plan.parsed.cages.get(cageId);
+        if (!cage) continue;
+
+        const op = cage.token[0];
+        const value = parseInt(cage.token.slice(1), 10);
+        if (!Number.isFinite(value)) continue;
+
+        const result = cageOrderAmbiguity(w, cage.cells, op, value, forcedDigits);
+        if (!result || result.multisetCount !== 1) continue;
+
+        for (const cell of result.emptyCells) {
+            if (result.perCellCandidates.get(cell).size > 1) cells.push(cell);
+        }
+    }
+    return cells;
+}
+
+/**
+ * Re-send the "ambiguous cage order" overlay for `entry`, but only if
+ * the player actually has it turned on
+ * (puzzleState.highlightingAmbiguousOrder) -- a harmless no-op
+ * otherwise, so every call site below can call this unconditionally.
+ * Same two callers, for the same reasons, as refreshNextGroupHighlight()
+ * and refreshExtraClueGreyOut() above.
+ */
+function refreshAmbiguousOrderHighlight(entry) {
+    const puzzleState = Alpine.store("puzzleState");
+    if (!puzzleState.highlightingAmbiguousOrder) return;
+
+    const plan = entry && entry.stagePlan;
+    sendMessage("setAmbiguousOrderHighlight", deducibleCompositionCells(entry), plan && plan.w);
+}
+
+/**
+ * Toggle a third overlay (independent of both "highlight next group"
+ * and "grey out extra clues" above, drawn in its own sibling div so
+ * all three can be shown together without interfering with each
+ * other's clear/redraw) that highlights every cell whose cage's digit
+ * composition is uniquely deducible from clues up to the next unsolved
+ * digit group, but whose specific order (which cell gets which digit)
+ * is still ambiguous -- see deducibleCompositionCells() for exactly
+ * which cells that is. A no-op (leaves it off) if the current puzzle
+ * has no resolved stagePlan, same as the other two toggles.
+ *
+ * The on/off state this sets (puzzleState.highlightingAmbiguousOrder)
+ * persists across puzzle switches -- see refreshAmbiguousOrderHighlight().
+ */
+function toggleAmbiguousOrderHighlight() {
+    const puzzleState = Alpine.store("puzzleState");
+
+    if (puzzleState.highlightingAmbiguousOrder) {
+        puzzleState.highlightingAmbiguousOrder = false;
+        sendMessage("setAmbiguousOrderHighlight", null);
+        return;
+    }
+
+    const entry = Alpine.store("puzzleList").current;
+    if (!entry || !entry.stagePlan) return;
+
+    puzzleState.highlightingAmbiguousOrder = true;
+    refreshAmbiguousOrderHighlight(entry);
+}
+
+/**
  * Stage 4: send the Archipelago location check for a digit group as
  * soon as the player has actually, correctly filled in its cells --
  * not when the engine's own "solved" callback fires (js_update_status),
@@ -2201,6 +2334,9 @@ function syncAPStatus() {
         // Same idea, for the "grey out extra clues" overlay -- see
         // refreshExtraClueGreyOut().
         refreshExtraClueGreyOut(puzzleList.current);
+        // Same idea again, for the "ambiguous cage order" overlay --
+        // see refreshAmbiguousOrderHighlight().
+        refreshAmbiguousOrderHighlight(puzzleList.current);
     }
 
     if (anyNewRemoteSolves) {
@@ -2800,6 +2936,7 @@ window.redoPuzzle = redoPuzzle;
 window.solvePuzzle = solvePuzzle;
 window.toggleNextGroupHighlight = toggleNextGroupHighlight;
 window.toggleExtraClueGreyOut = toggleExtraClueGreyOut;
+window.toggleAmbiguousOrderHighlight = toggleAmbiguousOrderHighlight;
 window.setPreset = setPreset;
 window.savePuzzleData = savePuzzleData;
 window.loadPuzzleData = loadPuzzleData;

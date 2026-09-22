@@ -346,6 +346,38 @@ function setExtraClueGreyOut(cells, w) {
     }
 }
 
+// Show or clear the "ambiguous cage order" overlay (see
+// toggleAmbiguousOrderHighlight() in src/puzzles.js, which computes
+// which currently-relevant cells belong to a cage whose digit
+// composition is known but whose order isn't -- this function only
+// knows how to draw them). Deliberately its own sibling overlay
+// div/CSS class, same reasoning as setExtraClueGreyOut() above: all
+// three overlays (this one, the next-group highlight, and the
+// grey-out) can be shown together without any of them wiping out
+// another's boxes. Same cell-to-percentage geometry as
+// setDigitGroupHighlight() above.
+function setAmbiguousOrderHighlight(cells, w) {
+    const overlay = document.getElementById("ambiguousOrderHighlight");
+    if (!overlay) return;
+
+    overlay.innerHTML = "";
+    if (!cells || !w) return;
+
+    const cellPercent = 100 / (w + 1);
+    for (const cell of cells) {
+        const row = Math.floor(cell / w);
+        const col = cell % w;
+
+        const div = document.createElement("div");
+        div.className = "ambiguous-order-highlight-cell";
+        div.style.left = `${(col + 0.5) * cellPercent}%`;
+        div.style.top = `${(row + 0.5) * cellPercent}%`;
+        div.style.width = `${cellPercent}%`;
+        div.style.height = `${cellPercent}%`;
+        overlay.appendChild(div);
+    }
+}
+
 const messageHandlers = {
     loadPuzzle, setPreset, showPreferences,
     puzzleFromId, puzzleFromSeed,
@@ -353,7 +385,7 @@ const messageHandlers = {
     dialogReturnString, dialogReturnInt, dialogConfirm, dialogCancel,
     setNewGameEnabled,
     savePuzzleData, loadPuzzleData,
-    getForcedDigits, setDigitGroupHighlight, setExtraClueGreyOut, getCurrentGrid, getCurrentPencil,
+    getForcedDigits, setDigitGroupHighlight, setExtraClueGreyOut, setAmbiguousOrderHighlight, getCurrentGrid, getCurrentPencil,
     revealClues, applyMove
 }
 
