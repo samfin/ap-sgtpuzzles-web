@@ -1624,6 +1624,83 @@ function restartPuzzleCallback() {
     }
 }
 
+/**
+ * Highest Digit Group number already checked for `entry` (0 if none).
+ * Scans every group up to plan.stages.length -- rather than trusting
+ * the first gap the way nextGroupHighlightCells()/extraClueCells() do
+ * for "what's next" -- and takes the MAX, since what's wanted here is
+ * "how much correct, solver-verified digit data can we safely restore,"
+ * not "what's the next thing to work on." forcedDigits is cumulative
+ * (stage k's forced cells are a superset of stage k-1's, an invariant
+ * established since Refinement 3), so the highest checked group always
+ * has at least as much correct data as any lower one, regardless of
+ * whether some lower group's own location happens to be unchecked for
+ * some other reason -- checks aren't guaranteed to land in strict order
+ * (same caveat as everywhere else in this file that scans checked
+ * locations). A group number beyond plan.stages.length (possible via
+ * checkDigitGroupProgress()'s fullySolved catch-up, which can check
+ * locations past plan.stages.length when entry.digitGroupCount is
+ * larger) is deliberately not reachable by this scan -- but that's
+ * fine, since fullySolved being true already implies stage
+ * plan.stages.length-1's forcedDigits is the complete grid, so capping
+ * at plan.stages.length still yields the correct (fully-solved) fill.
+ */
+function highestCheckedGroupNumber(entry) {
+    const plan = entry && entry.stagePlan;
+    if (!plan || !isApReady()) return 0;
+
+    let highest = 0;
+    for (let g = 1; g <= plan.stages.length; g++) {
+        const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
+        if (locationId !== undefined && client.room.checkedLocations.includes(locationId)) {
+            highest = g;
+        }
+    }
+    return highest;
+}
+
+/**
+ * Autofills every cell forced by the highest Digit Group already
+ * checked for `entry` (see highestCheckedGroupNumber() above), as a
+ * single atomic move via the existing 'F' move grammar's digit-fill
+ * form (the same native primitive the double-right-click feature
+ * uses) -- so restarting a puzzle doesn't throw away digits the
+ * player has already earned credit for.
+ *
+ * Uses plan.stages[highest - 1].forcedDigits (the real solver's own
+ * output for that stage) rather than trying to snapshot the player's
+ * actual pre-restart grid: forcedDigits is guaranteed to be exactly
+ * what the player had entered at the moment the check fired
+ * (checkDigitGroupProgress() only checks a group once the live grid
+ * matches its forcedDigits exactly at that group's own cells), and
+ * unlike a live snapshot, it's completely unaffected by the restart
+ * itself wiping the grid out from under it.
+ *
+ * A harmless no-op if nothing's been checked yet for this puzzle.
+ */
+async function autofillSolvedGroups(entry) {
+    const plan = entry && entry.stagePlan;
+    if (!plan) return;
+
+    const highest = highestCheckedGroupNumber(entry);
+    if (highest === 0) return;
+
+    const forcedDigits = plan.stages[highest - 1].forcedDigits;
+    const w = plan.w;
+
+    const parts = [];
+    for (let i = 0; i < forcedDigits.length; i++) {
+        const digit = forcedDigits[i];
+        if (digit === '0') continue;
+        const x = i % w;
+        const y = Math.floor(i / w);
+        parts.push(`${x},${y},D${digit}`);
+    }
+    if (parts.length === 0) return;
+
+    await applyMove(`F${parts.join(';')}`);
+}
+
 async function restartPuzzle() {
     await new Promise((resolve) => {
         pendingRestartPuzzleResolve = resolve;
@@ -1640,10 +1717,17 @@ async function restartPuzzle() {
     // a fresh check by clearing entry.displayedClueCount, then let
     // liveRevealClues() re-reveal whatever should currently be visible
     // (harmless no-op if nothing was actually lost).
+    //
+    // Restart also wipes every entered digit, including ones for Digit
+    // Groups the player already has AP credit for -- autofillSolvedGroups()
+    // (user's request) restores those in a single atomic move right
+    // after the clue re-reveal, so re-solving an already-checked group
+    // from scratch is never required just because the puzzle restarted.
     const entry = Alpine.store("puzzleList").current;
     if (entry?.stagePlan) {
         entry.displayedClueCount = 0;
         await liveRevealClues(entry);
+        await autofillSolvedGroups(entry);
     }
 }
 
@@ -1809,6 +1893,13 @@ function toggleNextGroupHighlight() {
  * be -- consistent treatment for "not needed right now," per the user's
  * explicit request, rather than distinguishing "extra and visible" from
  * "extra and still masked."
+ *
+ * This is also exactly the complement of `stage.cageIds` used by
+ * deducibleCompositionCells() (the green "ambiguous order" overlay) for
+ * this same target stage -- see that function's own doc comment for why
+ * that makes green and grey mutually exclusive by construction, even for
+ * a still-masked cage whose composition happens to be fully deducible via
+ * row/column elimination alone (it's grey, never green).
  */
 function extraClueCells(entry) {
     const plan = entry && entry.stagePlan;
@@ -1920,6 +2011,21 @@ function toggleExtraClueGreyOut() {
  * "Next unsolved group" is found the same way nextGroupHighlightCells()
  * finds it -- see that function's own doc comment for why this can't
  * just be checkedGroupCount + 1.
+ *
+ * IMPORTANT INVARIANT (green cages must always be clued): the loop
+ * below only ever visits cages in `stage.cageIds` -- it never examines
+ * a cage outside that set, even though forcedDigits (being the real
+ * solver's whole-grid output) can legitimately force -- or even fully
+ * pin down the composition of -- cells belonging to a still-masked
+ * cage purely via row/column Latin-square elimination from OTHER
+ * cages' clues. Such a cage is deliberately never considered here, so
+ * it always falls to extraClueCells()'s grey overlay instead (which
+ * covers exactly the complementary cage set, every cage NOT in
+ * `stage.cageIds`) rather than ever being colored green. Green and
+ * grey are therefore always mutually exclusive by construction, since
+ * they partition the exact same cage universe by membership in the
+ * same `stage.cageIds` set -- do not change this loop to consider any
+ * cage outside `stage.cageIds`, or that guarantee breaks.
  *
  * The actual composition/order reasoning is cageOrderAmbiguity() in
  * keenDivision.js -- see its own doc comment for the full algorithm
