@@ -1412,26 +1412,31 @@ function applyMove(movestr) {
  * inferred onto any other cell (see cageCandidateDigits()'s doc
  * comment for the same "don't be smart" principle on the cage side).
  *
- * If a cell's candidate set, after that row/column elimination, comes
+ * If a cell's FINAL candidate set (see mergedCandidates() below) comes
  * down to exactly one digit, that digit is certain -- it's filled in
  * as a real digit instead of a single-candidate pencil mark (user's
  * request; see onlyCandidateDigit()/movePartFor() below). This applies
  * per cell, independently, in both modes: a clued cage's whole-cage
  * fill can mix digit-fills and pencil-mark cells in the same move,
  * and the unclued single-cell mode either fills that one cell's digit
- * or pencils its candidates, whichever applies.
+ * or pencils its candidates, whichever applies. This holds regardless
+ * of whether the player clicked directly on that particular cell --
+ * every still-empty cell this function touches (the whole cage, for a
+ * clued cage) gets the same treatment.
  *
- * The double-right-clicked cell itself must be completely blank --
- * no real digit filled in, AND no pencil marks already present,
- * whether from an earlier double-right-click or the player's own
- * manual 'P' toggles -- or nothing happens at all. Since the 'F' move
- * this builds REPLACES (not merges) a cell's pencil marks, overwriting
- * an already-annotated cell would blow away work the player already
- * did, which is exactly the annoyance the user asked to avoid; a
- * genuinely blank cell has nothing to lose. (For the clued-cage case,
- * this check only applies to the clicked cell -- the rest of that
- * cage's still-empty cells are filled/overwritten as before, since
- * they're all part of the one deliberate whole-cage reveal.)
+ * The double-right-clicked cell must have no real digit filled in yet
+ * -- a filled cell has nothing left to pencil in, and the 'F' move
+ * itself already no-ops on a filled cell regardless (see keen.c's
+ * execute_move()). Unlike the feature's original design, an already
+ * pencil-marked cell is no longer skipped entirely (user's explicit
+ * "consistent behavior" request): every empty cell this function
+ * touches gets its candidates recomputed and MERGED with whatever it
+ * already had marked, via mergedCandidates() below -- existing marks
+ * can only be narrowed (or promoted to a digit-fill), never widened
+ * beyond what the player already had pencilled in, and a cell whose
+ * final result is unchanged from its current state is simply left out
+ * of the move entirely (so double-right-clicking somewhere that
+ * teaches nothing new doesn't spam the undo stack with no-op moves).
  *
  * `tx`,`ty` come from emccpre-ap.js's own double-right-click detection
  * (see cellFromCanvasXY() there) -- it only knows raw column/row, not
@@ -1453,15 +1458,16 @@ async function handleCellDoubleRightClicked(tx, ty) {
     const currentGrid = await getCurrentGrid();
     if (!currentGrid) return;
 
-    // Only ever act on a cell that's completely blank -- see this
-    // function's own doc comment above for why.
+    // Only ever act when the double-right-clicked cell itself has no
+    // real digit yet -- see this function's own doc comment above.
     if (currentGrid[cellIndex] !== '0') return;
 
     const currentPencilStr = await getCurrentPencil();
-    if (currentPencilStr) {
-        const currentPencil = currentPencilStr.split(',').map(Number);
-        if (currentPencil[cellIndex]) return;
-    }
+    const currentPencil = currentPencilStr ? currentPencilStr.split(',').map(Number) : null;
+
+    // A cell's currently-recorded pencil bitmask, or 0 if none (either
+    // no pencil data at all, or that specific cell has none set).
+    const existingPencil = (cell) => (currentPencil ? (currentPencil[cell] || 0) : 0);
 
     // "The cage must have a known clue for this to work" (for the
     // whole-cage, arithmetic-aware fill) -- this checks the SAME
@@ -1489,13 +1495,28 @@ async function handleCellDoubleRightClicked(tx, ty) {
         return seen;
     };
 
-    // If a cell's FINAL candidate set (after row/column elimination)
-    // narrows down to exactly one digit, that digit is certain --
-    // fill it in as a real digit instead of a single-candidate pencil
-    // mark (user's request). Returns that digit, or null if `bitmask`
-    // has zero or more than one bit set (including the "no candidates
-    // at all" case, which is left as an empty pencil mark, unchanged
-    // from before this feature).
+    // Merges a freshly-computed candidate bitmask for `cell` with
+    // whatever it already has pencilled in, per the user's explicit
+    // rule: double-right-click can narrow (remove) an existing cell's
+    // candidates, but must never introduce one the player doesn't
+    // already have marked. A cell with NO existing marks at all
+    // (bitmask 0, i.e. genuinely untouched) is treated as having no
+    // restriction yet -- the fresh computation is used as-is, exactly
+    // like every double-right-click before this refinement -- rather
+    // than as "zero candidates allowed," which would make the whole
+    // feature a no-op on a blank cell.
+    const mergedCandidates = (cell, freshBitmask) => {
+        const existing = existingPencil(cell);
+        return existing === 0 ? freshBitmask : (existing & freshBitmask);
+    };
+
+    // If a cell's FINAL candidate set (after row/column elimination
+    // and merging with whatever it already had marked) comes down to
+    // exactly one digit, that digit is certain -- fill it in as a
+    // real digit instead of a single-candidate pencil mark (user's
+    // request). Returns that digit, or null if `bitmask` has zero or
+    // more than one bit set (including the "no candidates at all"
+    // case, which is left as an empty pencil mark).
     const onlyCandidateDigit = (bitmask) => {
         let digit = null;
         for (let d = 1; d <= w; d++) {
@@ -1506,6 +1527,16 @@ async function handleCellDoubleRightClicked(tx, ty) {
         }
         return digit;
     };
+
+    // Whether `cell` actually changes if given this (already merged)
+    // final bitmask -- either it resolves to a single digit (always a
+    // real change, since only cells with no digit yet reach here at
+    // all) or the pencil bitmask itself differs from what's already
+    // recorded. Used to leave a cell out of the move entirely when
+    // double-right-click would teach it nothing new, so repeating the
+    // gesture somewhere that's already fully known doesn't push a
+    // spurious no-op entry onto the undo stack.
+    const cellChanged = (cell, bitmask) => onlyCandidateDigit(bitmask) !== null || bitmask !== existingPencil(cell);
 
     // Builds one "F" move entry for a cell: a digit-fill ("x,y,Dn")
     // if its bitmask has exactly one candidate left, otherwise the
@@ -1535,6 +1566,9 @@ async function handleCellDoubleRightClicked(tx, ty) {
             for (const d of result.candidates) {
                 if (!seen.has(d)) bitmask |= (1 << d);
             }
+            bitmask = mergedCandidates(cell, bitmask);
+            if (!cellChanged(cell, bitmask)) continue;
+
             const row = Math.floor(cell / w);
             const col = cell % w;
             moveParts.push(movePartFor(col, row, bitmask));
@@ -1548,8 +1582,8 @@ async function handleCellDoubleRightClicked(tx, ty) {
         for (let d = 1; d <= w; d++) {
             if (!seen.has(d)) bitmask |= (1 << d);
         }
-        if (bitmask === 0) return;
-        moveParts = [movePartFor(tx, ty, bitmask)];
+        bitmask = mergedCandidates(cellIndex, bitmask);
+        moveParts = cellChanged(cellIndex, bitmask) ? [movePartFor(tx, ty, bitmask)] : [];
     }
 
     if (moveParts.length === 0) return;
