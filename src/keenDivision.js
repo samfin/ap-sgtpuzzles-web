@@ -574,9 +574,83 @@ function cageCandidateDigits(w, cageCells, op, value, currentGrid) {
     // it to be left out.
     const isMonochrome = (multiset) => n > 1 && multiset.every((d) => d === multiset[0]);
 
+    // If every one of the cage's cells lies in the SAME row or the
+    // SAME column, the Latin-square rule alone (never repeat a digit
+    // in one row/column) already forbids ANY duplicate anywhere in the
+    // cage -- not just the fully-monochrome case above -- since every
+    // pair of cells in the cage shares that one row/column. E.g. a
+    // straight 3-cell horizontal cage can never legally be {1,5,5}
+    // (unlike the L-shaped x25 example above, where two of the three
+    // cells don't share a row or column, so a repeated digit really
+    // is possible). A cage that ISN'T confined to one line keeps the
+    // narrower isMonochrome-only exclusion, since a partial duplicate
+    // can be genuinely legal there (user's request).
+    const confinedToOneLine = n > 1 && (() => {
+        const firstRow = Math.floor(cageCells[0] / w);
+        const firstCol = cageCells[0] % w;
+        const sameRow = cageCells.every((c) => Math.floor(c / w) === firstRow);
+        const sameCol = cageCells.every((c) => c % w === firstCol);
+        return sameRow || sameCol;
+    })();
+    const hasDuplicate = (multiset) => {
+        const seen = new Set();
+        for (const d of multiset) {
+            if (seen.has(d)) return true;
+            seen.add(d);
+        }
+        return false;
+    };
+    const excludeMultiset = confinedToOneLine ? hasDuplicate : isMonochrome;
+
+    // A digit that EVERY empty cell of the cage independently excludes
+    // via its own row/column ("sees" elsewhere) can never actually be
+    // placed in this cage at all, no matter which cell it's assigned
+    // to -- so any multiset that needs it is entirely impossible, not
+    // just narrower. E.g. a horizontal 2-cell 7+ cage with a "1"
+    // elsewhere in that shared row excludes 1 from BOTH cells, so the
+    // {1,6} multiset can never be realized -- both 1 AND 6 should
+    // disappear from the candidate set, not just 1 (dropping only the
+    // digit itself, after the fact, would incorrectly leave 6 behind,
+    // since 6's only pairing in a 7+ cage is with the now-impossible
+    // 1). This generalizes past a single shared line, per the user's
+    // own example: it's each cell's OWN row/column exclusion set that
+    // matters, so two cells in different columns that each separately
+    // see a "1" also make 1 globally forbidden for this cage, exactly
+    // like a single shared row would. This is the one place
+    // cageCandidateDigits() looks outside the cage itself -- unlike
+    // the ordinary per-cell "sees" elimination the caller applies
+    // afterward (which only trims one cell's own bitmask, never
+    // inferring anything about another cell), this is a per-CAGE fact
+    // (a digit no cell can hold at all), so it has to be applied here,
+    // during multiset enumeration, for the whole multiset it appears
+    // in to be correctly dropped instead of just that one digit.
+    const globallyForbidden = new Set();
+    if (currentGrid) {
+        const rowColSeenFor = (cell) => {
+            const row = Math.floor(cell / w);
+            const col = cell % w;
+            const seen = new Set();
+            for (let c = 0; c < w; c++) {
+                const ch = currentGrid[row * w + c];
+                if (c !== col && ch !== '0') seen.add(ch.charCodeAt(0) - '0'.charCodeAt(0));
+            }
+            for (let r = 0; r < w; r++) {
+                const ch = currentGrid[r * w + col];
+                if (r !== row && ch !== '0') seen.add(ch.charCodeAt(0) - '0'.charCodeAt(0));
+            }
+            return seen;
+        };
+        const perCellSeen = emptyCells.map(rowColSeenFor);
+        for (let d = 1; d <= w; d++) {
+            if (perCellSeen.every((seen) => seen.has(d))) globallyForbidden.add(d);
+        }
+    }
+    const hasForbiddenDigit = (multiset) => multiset.some((d) => globallyForbidden.has(d));
+
     const recurse = (start) => {
         if (current.length === n) {
-            if (isMonochrome(current)) return;
+            if (excludeMultiset(current)) return;
+            if (hasForbiddenDigit(current)) return;
             if (!satisfiesClue(current)) return;
             const counts = countsOf(current);
             if (!admitsFilled(counts)) return;
@@ -692,6 +766,29 @@ function cageOrderAmbiguity(w, cageCells, op, value, knownGrid) {
 
     const isMonochrome = (multiset) => n > 1 && multiset.every((d) => d === multiset[0]);
 
+    // Same "confined to one row/column -> no duplicate anywhere is
+    // legal" rule as cageCandidateDigits() above (kept in sync with it
+    // deliberately, since both functions enumerate the exact same set
+    // of cage-arithmetic-admissible multisets and must agree on which
+    // ones are even possible) -- see that function's own doc comment
+    // for the full reasoning and the straight-3-cell-cage example.
+    const confinedToOneLine = n > 1 && (() => {
+        const firstRow = Math.floor(cageCells[0] / w);
+        const firstCol = cageCells[0] % w;
+        const sameRow = cageCells.every((c) => Math.floor(c / w) === firstRow);
+        const sameCol = cageCells.every((c) => c % w === firstCol);
+        return sameRow || sameCol;
+    })();
+    const hasDuplicate = (multiset) => {
+        const seen = new Set();
+        for (const d of multiset) {
+            if (seen.has(d)) return true;
+            seen.add(d);
+        }
+        return false;
+    };
+    const excludeMultiset = confinedToOneLine ? hasDuplicate : isMonochrome;
+
     // Row/column exclusion set for one cell, computed from knownGrid --
     // same per-cell independence (never inferred onto another cell)
     // as cageCandidateDigits()'s own caller-side elimination.
@@ -746,7 +843,7 @@ function cageOrderAmbiguity(w, cageCells, op, value, knownGrid) {
     const current = [];
     const recurseMultisets = (start) => {
         if (current.length === n) {
-            if (isMonochrome(current)) return;
+            if (excludeMultiset(current)) return;
             if (!satisfiesClue(current)) return;
             const counts = countsOf(current);
             if (!admitsFilled(counts)) return;
