@@ -645,16 +645,30 @@ function cageCandidateDigits(w, cageCells, op, value, currentGrid) {
             if (perCellSeen.every((seen) => seen.has(d))) globallyForbidden.add(d);
         }
     }
-    const hasForbiddenDigit = (multiset) => multiset.some((d) => globallyForbidden.has(d));
-
     const recurse = (start) => {
         if (current.length === n) {
             if (excludeMultiset(current)) return;
-            if (hasForbiddenDigit(current)) return;
             if (!satisfiesClue(current)) return;
             const counts = countsOf(current);
             if (!admitsFilled(counts)) return;
             for (const [d, c] of filledCounts) counts.set(d, (counts.get(d) || 0) - c);
+            // Check globallyForbidden against the REMAINING digits (after
+            // subtracting what the cage's own filled cells already
+            // account for) -- never against the raw multiset. A digit
+            // the multiset contains but that's already fully satisfied
+            // by a filled cage-mate (remaining === 0) doesn't need a new
+            // home at all, so it must never veto the whole multiset just
+            // because that cage-mate's own already-placed digit happens
+            // to be "seen" (via the shared row/column every cage cell
+            // sits in) by another empty cell of the SAME cage. That was
+            // the bug: a 2-cell subtraction/division cage with one cell
+            // already filled would have its only valid multiset thrown
+            // out, because the lone remaining empty cell "saw" its own
+            // cage-mate's digit and -- with only one empty cell -- that
+            // trivially looked like every empty cell forbidding it.
+            for (const [d, remaining] of counts) {
+                if (remaining > 0 && globallyForbidden.has(d)) return;
+            }
             for (const [d, remaining] of counts) {
                 if (remaining > 0) candidates.add(d);
             }
