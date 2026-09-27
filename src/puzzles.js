@@ -816,11 +816,31 @@ async function resolveKeenStagePlan(entry, gameId) {
     if (colonIndex === -1) {
         throw new Error(`Expected a full game id ("params:desc"), got: ${gameId}`);
     }
-    const paramsStr = gameId.slice(0, colonIndex);
+    // Deliberately NOT gameId.slice(0, colonIndex) for paramsStr: that's
+    // the permalink's own "short" params form (js_update_permalinks's
+    // gameId comes from midend_get_game_id(), which always calls
+    // encode_params(..., full=false) -- see keen.c) and NEVER includes
+    // the difficulty letter, for any Keen puzzle, regardless of how it
+    // was created. keen_solve_partial() is capped at params->diff, so
+    // every getForcedDigits() call below needs the puzzle's REAL
+    // difficulty or it silently solves as if the puzzle were Normal --
+    // which can fail to force anything at all from a Hard/Extreme
+    // puzzle's full clue set, corrupting the whole stage plan (see
+    // progress-notes.md for the incident this caused). entry.params is
+    // the fix: it's this puzzle's own native spec ("<width>d<diff>[m]"),
+    // set once in ArchipelagoPuzzle's constructor from the AP world's
+    // puzzle type string (see randomizer.py's parse_puzzle_type()) and
+    // never round-tripped through the diff-dropping permalink encoding,
+    // so it reliably carries the real difficulty for every AP-managed
+    // Keen puzzle (the only kind this function is ever called for --
+    // see loadKeenAwarePuzzleEntry()'s isProgressiveKeen check). Only
+    // the *descriptor* half still needs to come from gameId, since
+    // that's the one place the actual generated cages/clues live.
+    const paramsStr = entry.params;
     const desc = gameId.slice(colonIndex + 1);
-    const widthMatch = /^\d+/.exec(paramsStr);
+    const widthMatch = /^\d+/.exec(paramsStr || "");
     if (!widthMatch) {
-        throw new Error(`Couldn't read grid width from params string: ${paramsStr}`);
+        throw new Error(`Couldn't read grid width from puzzle params: ${paramsStr}`);
     }
     const w = parseInt(widthMatch[0], 10);
 
