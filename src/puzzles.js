@@ -1705,8 +1705,7 @@ function highestCheckedGroupNumber(entry) {
 
     let highest = 0;
     for (let g = 1; g <= plan.stages.length; g++) {
-        const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
-        if (locationId !== undefined && client.room.checkedLocations.includes(locationId)) {
+        if (isDigitGroupChecked(entry, g)) {
             highest = g;
         }
     }
@@ -1857,8 +1856,7 @@ function nextGroupHighlightCells(entry) {
     let targetGroupNumber = 0;
     if (isApReady()) {
         for (let g = 1; g <= reachableCount; g++) {
-            const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
-            if (locationId === undefined || !client.room.checkedLocations.includes(locationId)) {
+            if (!isDigitGroupChecked(entry, g)) {
                 targetGroupNumber = g;
                 break;
             }
@@ -1965,8 +1963,7 @@ function extraClueCells(entry) {
     let targetGroupNumber = 0;
     if (isApReady()) {
         for (let g = 1; g <= reachableCount; g++) {
-            const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
-            if (locationId === undefined || !client.room.checkedLocations.includes(locationId)) {
+            if (!isDigitGroupChecked(entry, g)) {
                 targetGroupNumber = g;
                 break;
             }
@@ -2102,8 +2099,7 @@ function deducibleCompositionCells(entry) {
     let targetGroupNumber = 0;
     if (isApReady()) {
         for (let g = 1; g <= reachableCount; g++) {
-            const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
-            if (locationId === undefined || !client.room.checkedLocations.includes(locationId)) {
+            if (!isDigitGroupChecked(entry, g)) {
                 targetGroupNumber = g;
                 break;
             }
@@ -2209,6 +2205,55 @@ function toggleAmbiguousOrderHighlight() {
  * Alpine.store("puzzleList").current), so this never saves the wrong
  * puzzle's progress under the current one's name.
  */
+/**
+ * Client-side mirror of the Archipelago world's
+ * locations.py/digit_group_location_names(): the location name(s) that
+ * back one Digit Group, given the world's bonus_checks_per_digit_group
+ * option value. bonusChecks <= 0 (the default) returns just the one
+ * unnumbered name, exactly as every Digit Group was named before this
+ * option existed; a positive value returns (bonusChecks + 1) names, numbered
+ * "-1" through "-(bonusChecks + 1)", all released together the moment this
+ * Digit Group is satisfied -- see checkDigitGroupProgress() below, the only
+ * caller.
+ * @param {number} puzzleNumber
+ * @param {number} groupNumber
+ * @param {number} bonusChecks
+ * @returns {string[]}
+ */
+function digitGroupLocationNames(puzzleNumber, groupNumber, bonusChecks) {
+    const base = `Puzzle ${puzzleNumber} Digit Group ${groupNumber}`;
+    if (!(bonusChecks > 0)) return [base];
+    const names = [];
+    for (let k = 1; k <= bonusChecks + 1; k++) {
+        names.push(`${base}-${k}`);
+    }
+    return names;
+}
+
+/**
+ * True iff every location backing Digit Group `groupNumber` for `entry`
+ * (digitGroupLocationNames() above) is currently checked -- i.e. this
+ * group, as a whole, is done. With the default bonus_checks_per_digit_group
+ * == 0 this is exactly "is the group's one location checked", same as
+ * every call site here tested directly before that option existed; with a
+ * positive value, checkDigitGroupProgress() always checks every one of a
+ * group's numbered locations together as a single atomic release, so this
+ * only reports true once the whole bundle has landed, never on a partial
+ * subset. Reads the current file's bonusChecksPerDigitGroup itself so
+ * every call site stays as simple as it was before this option existed.
+ * @param {object} entry
+ * @param {number} groupNumber
+ * @returns {boolean}
+ */
+function isDigitGroupChecked(entry, groupNumber) {
+    if (!isApReady()) return false;
+    const bonusChecksPerDigitGroup = Alpine.store("gamesaves").current?.bonusChecksPerDigitGroup ?? 0;
+    return digitGroupLocationNames(entry.index, groupNumber, bonusChecksPerDigitGroup).every(name => {
+        const locationId = locationNameToId(name);
+        return locationId !== undefined && client.room.checkedLocations.includes(locationId);
+    });
+}
+
 async function checkDigitGroupProgress(entry) {
     if (!isApReady()) return;
     const plan = entry && entry.stagePlan;
@@ -2216,6 +2261,13 @@ async function checkDigitGroupProgress(entry) {
 
     const unlockedCount = countReceivedClueSets(entry.index);
     if (unlockedCount <= 0) return;
+
+    // How many EXTRA locations (on top of each Digit Group's own one) this
+    // world's bonus_checks_per_digit_group option split every Digit Group
+    // into -- see digitGroupLocationNames() above. Falls back to 0 (the
+    // "just the one location per group" behavior this world always had) if
+    // there's no current save file or it predates this field.
+    const bonusChecksPerDigitGroup = Alpine.store("gamesaves").current?.bonusChecksPerDigitGroup ?? 0;
 
     const currentGrid = await getCurrentGrid();
     if (!currentGrid) return;
@@ -2233,10 +2285,12 @@ async function checkDigitGroupProgress(entry) {
         if (cells.length === 0) continue;
         if (!cells.every(i => currentGrid[i] === plan.stages[groupNumber - 1].forcedDigits[i])) continue;
 
-        const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${groupNumber}`);
-        if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
-            client.check(locationId);
-            newlyChecked = true;
+        for (const locationName of digitGroupLocationNames(entry.index, groupNumber, bonusChecksPerDigitGroup)) {
+            const locationId = locationNameToId(locationName);
+            if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
+                client.check(locationId);
+                newlyChecked = true;
+            }
         }
     }
 
@@ -2266,10 +2320,12 @@ async function checkDigitGroupProgress(entry) {
     if (fullySolved) {
         const totalGroups = Math.max(plan.stages.length, entry.digitGroupCount || plan.stages.length);
         for (let groupNumber = 1; groupNumber <= totalGroups; groupNumber++) {
-            const locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${groupNumber}`);
-            if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
-                client.check(locationId);
-                newlyChecked = true;
+            for (const locationName of digitGroupLocationNames(entry.index, groupNumber, bonusChecksPerDigitGroup)) {
+                const locationId = locationNameToId(locationName);
+                if (locationId !== undefined && !client.room.checkedLocations.includes(locationId)) {
+                    client.check(locationId);
+                    newlyChecked = true;
+                }
             }
         }
 
@@ -2422,9 +2478,8 @@ function syncAPStatus() {
         // search happened to produce -- so the *last* group number is a
         // reliable "is this puzzle entirely done" signal.
         let finalGroupNumber = entry.digitGroupCount || 1;
-        let locationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${finalGroupNumber}`);
 
-        if (!entry.collected && locationId !== undefined && client.room.checkedLocations.includes(locationId)) {
+        if (!entry.collected && isDigitGroupChecked(entry, finalGroupNumber)) {
             entry.collected = true;
             dirty = true;
         } else if (!entry.collected) {
@@ -2463,8 +2518,7 @@ function syncAPStatus() {
             const availableCount = entry.locked ? 0 : Math.min(countReceivedClueSets(entry.index), entry.digitGroupCount);
             let checkedCount = 0;
             for (let g = 1; g <= availableCount; g++) {
-                const groupLocationId = locationNameToId(`Puzzle ${entry.index} Digit Group ${g}`);
-                if (groupLocationId !== undefined && client.room.checkedLocations.includes(groupLocationId)) {
+                if (isDigitGroupChecked(entry, g)) {
                     checkedCount++;
                 }
             }
@@ -2561,7 +2615,8 @@ async function createFile(hostname, port, player, password) {
         baseSeed: "" + slotData.world_seed,
         solveTarget: slotData.solve_target,
         digitGroupCounts: slotData.digit_group_counts,
-        startingPuzzleCount: slotData.starting_puzzle_count
+        startingPuzzleCount: slotData.starting_puzzle_count,
+        bonusChecksPerDigitGroup: slotData.bonus_checks_per_digit_group
     });
 
     await clearPuzzle();
@@ -2659,6 +2714,7 @@ async function loadFile(file, secretMode, newConnection) {
         // versa.
         file.digitGroupCounts = slotData.digit_group_counts;
         file.startingPuzzleCount = slotData.starting_puzzle_count;
+        file.bonusChecksPerDigitGroup = slotData.bonus_checks_per_digit_group ?? 0;
     }
 
     if (newConnection && connectOk) {

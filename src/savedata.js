@@ -98,6 +98,22 @@ export class GameSave {
          */
         this.digitGroupCounts = options.digitGroupCounts ?? Array(this.puzzles.length).fill(1)
 
+        /**
+         * The Archipelago world's bonus_checks_per_digit_group option
+         * value (slot_data.bonus_checks_per_digit_group): how many EXTRA
+         * locations, on top of the one every Digit Group already has, each
+         * Digit Group is split into. 0 (the default, and the fail-open
+         * value for save files written before this field existed, or while
+         * there's no live connection to refresh it from) means every Digit
+         * Group has just its own single unnumbered location, same as
+         * before this option existed; see puzzles.js's
+         * digitGroupLocationNames(), the client-side mirror of the
+         * server's locations.py/digit_group_location_names(), for how this
+         * turns into actual location names.
+         * @type {number}
+         */
+        this.bonusChecksPerDigitGroup = options.bonusChecksPerDigitGroup ?? 0
+
         this.updateDescription();
     }
 
@@ -209,6 +225,7 @@ export class GameSave {
             puzzleLocked: this.puzzleLocked.slice(),
             startingPuzzleCount: this.startingPuzzleCount,
             digitGroupCounts: this.digitGroupCounts.slice(),
+            bonusChecksPerDigitGroup: this.bonusChecksPerDigitGroup,
             solveTarget: this.solveTarget
         };
     }
